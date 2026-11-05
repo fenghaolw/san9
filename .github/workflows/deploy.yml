@@ -1,7 +1,9 @@
-name: Deploy San9 to GitHub Pages
+name: CI/CD & GitHub Pages Deployment by Commits
 
 on:
   push:
+    branches: ['main']
+  pull_request:
     branches: ['main']
   workflow_dispatch:
 
@@ -11,35 +13,68 @@ permissions:
   id-token: write
 
 concurrency:
-  group: 'pages'
+  group: 'pages-${{ github.ref }}'
   cancel-in-progress: true
 
 jobs:
-  build-and-deploy:
+  # 阶段 1：每一次 Commit / PR 自动运行 SDD 规范完整性校验与确定性模拟核心单元测试
+  ci-verify:
+    name: SDD Spec & Deterministic Core Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Verify SDD Specification Documents (SPEC-00 .. SPEC-05)
+        run: |
+          for spec in specs/00-overview-and-vision.md \
+                      specs/01-core-loop-and-combat.md \
+                      specs/02-economy-pops-and-clans.md \
+                      specs/03-engine-and-ai-architecture.md \
+                      specs/04-data-schema-and-state.md \
+                      specs/05-roadmap-and-m1-demo-spec.md; do
+            test -s "$spec" && echo "✅ Verified $spec" || (echo "❌ Missing $spec" && exit 1)
+          done
+
+      - name: Run Deterministic Core Simulation Tests
+        run: npm test
+
+  # 阶段 2：按 Commit 构建最新主线版 + 全部历史 Commit 可玩快照，并自动部署至 GitHub Pages
+  deploy-pages:
+    name: Build & Deploy to GitHub Pages (with Per-Commit Archive)
+    needs: ci-verify
+    if: github.event_name != 'pull_request'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout full Git history for Per-Commit Snapshots
         uses: actions/checkout@v4
-      - name: Set up Node
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: 'npm'
-      - name: Install dependencies
-        run: npm ci
-      - name: Run deterministic unit tests
-        run: npm test
-      - name: Build production bundle
+
+      - name: Build Production Site & Per-Commit Playable Snapshots
         run: npm run build
-      - name: Setup Pages
+
+      - name: Setup GitHub Pages
         uses: actions/configure-pages@v5
-      - name: Upload artifact
+
+      - name: Upload Pages Artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: './dist'
+
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4

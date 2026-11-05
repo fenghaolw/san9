@@ -1,32 +1,13 @@
 {
   "name": "san9-grand-strategy",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
+  "description": "三国志9 × P社大战略：《中原逐鹿》可玩垂直切片 (SDD Spec-Driven Architecture)",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
-    "preview": "vite preview",
-    "test": "vitest run"
-  },
-  "dependencies": {
-    "lucide-react": "^0.468.0",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "three": "^0.172.0",
-    "zustand": "^5.0.3"
-  },
-  "devDependencies": {
-    "@types/node": "^22.10.2",
-    "@types/react": "^19.0.2",
-    "@types/react-dom": "^19.0.2",
-    "@types/three": "^0.172.0",
-    "@vitejs/plugin-react": "^4.3.4",
-    "autoprefixer": "^10.4.20",
-    "postcss": "^8.4.49",
-    "tailwindcss": "^3.4.17",
-    "typescript": "~5.7.2",
-    "vite": "^6.0.5",
-    "vitest": "^2.1.8"
+    "dev": "python3 server.py 8080",
+    "test": "node tests/run_node.js",
+    "test:jsc": "/System/Library/Frameworks/JavaScriptCore.framework/Versions/Current/Helpers/jsc -m tests/run_jsc.js",
+    "build": "node scripts/build_pages.mjs"
   }
 }

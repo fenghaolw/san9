@@ -1241,9 +1241,18 @@ export function App() {
           'button',
           {
             onClick: () => setShowOfficerTableModal(true),
-            className: 'ml-2 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-amber-500/40 text-amber-200 text-xs font-semibold cursor-pointer',
+            className: 'ml-1.5 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-amber-500/40 text-amber-200 text-xs font-semibold cursor-pointer',
           },
           '📋 天下名将录'
+        ),
+        h(
+          'a',
+          {
+            href: './commits/index.html',
+            title: '查看并试玩每一个历史 Git Commit 的独立构建快照 (Deployment by Commits)',
+            className: 'px-2.5 py-1 rounded bg-slate-900 hover:bg-slate-800 border border-sky-500/40 text-sky-300 text-xs font-semibold cursor-pointer no-underline',
+          },
+          '⏱️ Commit版本机'
         )
       )
     ),
