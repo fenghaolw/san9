@@ -4,6 +4,7 @@
  * 12 座核心都市 + 6 座咽喉关港、5 大可玩势力、核心名将及初始大地图内政建筑。
  */
 
+import { getHexDistance, getHexNeighbors } from '../core/map/pathfinder.js';
 import { deepClone } from '../core/utils/prng.js';
 import { TERRAIN_ENUM } from './tacticsAndFormations.js';
 import { GENTRY_CLANS } from './traitsAndClans.js';
@@ -92,24 +93,30 @@ function buildCentralPlainsTerrain() {
     setTile(fx, fy, TERRAIN_ENUM.FORD, 0.08);
   }
 
-  // 8. 铺设帝国官道网 (连接 12 城与 6 关港)
+  // 8. 铺设帝国六边形连续官道网 (沿六边形共边相邻格连续铺设)
   const drawRoad = (x0, y0, x1, y1) => {
     let cx = x0;
     let cy = y0;
-    while (cx !== x1 || cy !== y1) {
+    let guard = 0;
+    while ((cx !== x1 || cy !== y1) && guard++ < 200) {
       const idx = cy * MAP_WIDTH + cx;
       if (terrain[idx] !== TERRAIN_ENUM.WATER && terrain[idx] !== TERRAIN_ENUM.FORD) {
         terrain[idx] = TERRAIN_ENUM.ROAD;
         elevation[idx] = Math.min(elevation[idx], 0.32);
       }
-      if (cx !== x1 && cy !== y1) {
-        cx += Math.sign(x1 - cx);
-        cy += Math.sign(y1 - cy);
-      } else if (cx !== x1) {
-        cx += Math.sign(x1 - cx);
-      } else {
-        cy += Math.sign(y1 - cy);
+      const neighbors = getHexNeighbors(cx, cy, MAP_WIDTH, MAP_HEIGHT);
+      let best = neighbors[0];
+      let bestDist = Infinity;
+      for (const [nx, ny] of neighbors) {
+        const d = getHexDistance(nx, ny, x1, y1) + Math.hypot(nx - x1, ny - y1) * 0.05;
+        if (d < bestDist) {
+          bestDist = d;
+          best = [nx, ny];
+        }
       }
+      if (!best) break;
+      cx = best[0];
+      cy = best[1];
     }
     const endIdx = y1 * MAP_WIDTH + x1;
     if (terrain[endIdx] !== TERRAIN_ENUM.WATER) {

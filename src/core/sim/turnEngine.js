@@ -16,7 +16,7 @@ import {
   resolveSiegeBattleStep,
 } from '../combat/combatEngine.js';
 import { runXunEconomyAndPoliticsSettlement } from '../economy/economyEngine.js';
-import { findPathAStar, isInEnemyZOC } from '../map/pathfinder.js';
+import { findPathAStar, getHexDistance, isInEnemyZOC } from '../map/pathfinder.js';
 import { formatGameDate, SeededPRNG } from '../utils/prng.js';
 
 /**
@@ -102,12 +102,12 @@ export function stepExecutionTick(state) {
     const form = FORMATIONS[u.formationId] || FORMATIONS.FISH_SCALE;
     const attackRange = Math.max(1, form.range || 1);
 
-    // 优先检查周围是否有敌方野战部队进入交战距离
+    // 优先检查周围是否有敌方野战部队进入六边形交战距离
     const adjacentEnemyUnit = Object.values(state.units).find(
       (other) =>
         other.id !== u.id &&
         other.factionId !== u.factionId &&
-        Math.max(Math.abs(other.x - u.x), Math.abs(other.y - u.y)) <= attackRange
+        getHexDistance(other.x, other.y, u.x, u.y) <= attackRange
     );
 
     if (adjacentEnemyUnit) {
@@ -122,13 +122,13 @@ export function stepExecutionTick(state) {
         : Object.values(state.settlements).find(
             (s) =>
               s.factionId !== u.factionId &&
-              Math.max(Math.abs(s.x - u.x), Math.abs(s.y - u.y)) <= attackRange
+              getHexDistance(s.x, s.y, u.x, u.y) <= attackRange
           );
 
     if (
       targetSettlement &&
       targetSettlement.factionId !== u.factionId &&
-      Math.max(Math.abs(targetSettlement.x - u.x), Math.abs(targetSettlement.y - u.y)) <= attackRange
+      getHexDistance(targetSettlement.x, targetSettlement.y, u.x, u.y) <= attackRange
     ) {
       resolveSiegeBattleStep(state, u, targetSettlement, prng, isNewDayTick);
       continue;
