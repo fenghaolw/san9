@@ -1,7 +1,7 @@
-# SPEC-03：桌面多线程引擎架构、2.5D 分块渲染与三层效用 AI 规范
+# SPEC-03：桌面多线程引擎架构、2D 平面战略沙盘渲染与三层效用 AI 规范
 
-- **状态：** `APPROVED (已确认)`
-- **版本：** `v1.0.0`
+- **状态：** `APPROVED (已确认 - v1.1 切换为 2D 平面沙盘渲染)`
+- **版本：** `v1.1.0`
 - **关联模块：** `src/workers/`, `src/render/`, `src/core/ai/`
 
 ---
@@ -12,7 +12,7 @@
 
 ### 1.1 线程职责边界
 1. **Main Thread（主线程）：**
-   * 运行 Three.js 2.5D 沙盘渲染循环（`requestAnimationFrame`）与 React 19 宽屏 HUD / 弹窗 UI。
+   * 运行 **HTML5 2D High-DPI Canvas 平面沙盘渲染循环（`requestAnimationFrame`）** 与 React 19 宽屏 HUD / 弹窗 UI。
    * **严禁在主线程执行：** A\* / 流场寻路、热力图卷积、AI 效用评估、10 天 Tick 战斗结算。
 2. **Simulation & AI Worker（后台模拟与 AI 线程）：**
    * 维护权威的 `GameState` 与 `SeededPRNG`。
@@ -30,16 +30,15 @@
 
 ---
 
-## 2. Three.js 2.5D 分块渲染与五大战略透镜（Map Lenses）
+## 2. HTML5 2D High-DPI 平面沙盘渲染与五大战略透镜（Map Lenses）
 
-### 2.1 “伪3D”多角度沙盘相机（`MapCameraController`）
-* 采用低畸变透视相机（$\text{FOV} = 28^\circ$）：
-  * **平移（Pan）：** 键盘 `W/A/S/D`、方向键、鼠标中键拖拽或屏幕边缘滚动；
-  * **缩放（Zoom）：** 鼠标滚轮平滑插值相机距离 $d \in [18, 140]$；
-  * **旋转与俯仰（Orbit / Tilt）：** 键盘 `Q/E` 或按住鼠标右键拖拽，支持水平 $360^\circ$ 旋转（Yaw）与俯仰角 $\theta \in [35^\circ, 65^\circ]$ 调节，并提供一键归北（`N` 键）快捷操作。
+### 2.1 2D 平面战略沙盘相机（`MapCameraController`）
+* 采用高分屏自适应（`window.devicePixelRatio`）的正交 2D 矩阵变换（`ctx.setTransform`）：
+  * **平移（Pan）：** 键盘 `W/A/S/D`、方向键、鼠标左键拖拽；
+  * **缩放（Zoom）：** 鼠标滚轮以当前光标为中心进行无级缩放（单格像素大小 `tileSize` $\in [18\text{px}, 64\text{px}]$），并提供一键居中战区（`N` 或重置按钮）。
 
 ### 2.2 五大战略地图透镜（快捷键 `F1`～`F5`）
-通过切换 `ChunkedTerrainMesh` 的 Uniform 模式与 `TacticalOverlayLayer` 实现：
+通过 2D Canvas 分层绘制管线（地形底图 $\rightarrow$ 州郡疆域/热力染色层 $\rightarrow$ 官道与漕运流向层 $\rightarrow$ 城外内政与军事设施层 $\rightarrow$ 据点城郭层 $\rightarrow$ 行军箭头与战术兵牌层）实现：
 
 | 快捷键 | 透镜名称 | 视觉表现与战略用途 |
 | :---: | :--- | :--- |

@@ -1,13 +1,12 @@
 /**
- * SPEC-03: Three.js 2.5D 桌面端高刷沙盘渲染引擎
- * 支持：
- * - "伪3D" 可旋转 (Q/E 或右键拖拽 Yaw 360°) 与俯仰调节 (Pitch 32°~68°)、WASD 平移、滚轮缩放
- * - 64x44 高度图地形网格 + 黄河水波动画 + 官道与山岳立体起伏
- * - F1~F5 五大战略地图透镜实时着色切换 (战术沙盘 / 政治疆域 / 控制度世家 / 人口流民 / 军需漕运网)
- * - 立体城池/关隘/港口体块、城外 Lv1~Lv3 大地图内政建筑、野外连弩橹/前哨阵、5将立体兵棋与动态行军路线箭头
+ * SPEC-03 (v1.1): 纯 2D HTML5 High-DPI Canvas 平面战略沙盘渲染引擎
+ * 零 3D 依赖，采用古典军事舆图 + 战术兵棋风格 (Flat 2D Wargame & Classical Map)：
+ * - 支持 WASD / 鼠标左键拖拽平移、滚轮以鼠标为中心无级缩放、双击或按钮一键归中
+ * - 支持 F1~F5 五大战略地图透镜实时叠加 (战术沙盘 / 政治疆域 / 控制度与世家 / 四阶人口与流民 / 军需漕运网)
+ * - 清晰绘制：黄河水纹、太行/嵩山/崤山山形水墨纹理、帝国官道、城外 Lv1~Lv3 内政用地、
+ *   双层城郭/关隘/渡口、部队行军动态虚线箭头、五将战术兵牌与兵法联动飘字。
  */
 
-import * as THREE from 'three';
 import { ECONOMIC_BUILDING_DEFS, FORMATIONS, TERRAIN_DEFS, TERRAIN_ENUM } from '../data/tacticsAndFormations.js';
 
 export class SandboxScene {
@@ -18,732 +17,952 @@ export class SandboxScene {
   constructor(container, callbacks = {}) {
     this.container = container;
     this.callbacks = callbacks;
-    this.lensMode = 'TACTICAL'; // TACTICAL | POLITICAL | CONTROL_CLAN | POPS_REFUGEE | LOGISTICS
+    this.lensMode = 'TACTICAL';
     this.selectedSettlementId = 4; // 默认选中许昌
     this.selectedUnitId = null;
-    this.targetingMode = null; // 若非空，表示正在为某部队或出征选择地图目标
 
-    this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color('#0f172a');
-    this.scene.fog = new THREE.FogExp2('#0f172a', 0.0065);
-
-    const width = container.clientWidth || window.innerWidth;
-    const height = container.clientHeight || window.innerHeight;
-
-    // 低畸变 "伪3D" 战略沙盘透视相机 (FOV = 28°)
-    this.camera = new THREE.PerspectiveCamera(28, width / height, 1, 450);
-
-    // 相机球坐标参数
-    this.target = new THREE.Vector3(33, 0, 24); // 默认聚焦中原 (洛阳—虎牢关—许昌—官渡走廊)
-    this.distance = 44;
-    this.yaw = 0; // 0 弧度 = 正北朝上
-    this.pitch = 0.92; // ~53° 经典三国志9俯视倾角
-
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-    this.renderer.setSize(width, height);
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-    this.renderer.shadowMap.enabled = true;
+    this.canvas = document.createElement('canvas');
+    this.canvas.style.display = 'block';
+    this.canvas.style.width = '100%';
+    this.canvas.style.height = '100%';
     container.innerHTML = '';
-    container.appendChild(this.renderer.domElement);
+    container.appendChild(this.canvas);
+    this.ctx = this.canvas.getContext('2d');
 
-    // 灯光系统
-    const ambient = new THREE.AmbientLight('#e2e8f0', 1.15);
-    this.scene.add(ambient);
+    // 视图相机状态：中心对准中原核心走廊 (陈留—虎牢关—许昌—官渡, x=32, y=23)
+    this.tileSize = 30; // 单格默认像素尺寸 (支持 16px ~ 68px 缩放)
+    this.centerX = 32.5;
+    this.centerY = 23.5;
 
-    const sun = new THREE.DirectionalLight('#fffbeb', 1.55);
-    sun.position.set(25, 55, 30);
-    sun.castShadow = true;
-    this.scene.add(sun);
-
-    // 场景分组容器
-    this.terrainGroup = new THREE.Group();
-    this.settlementGroup = new THREE.Group();
-    this.plotGroup = new THREE.Group();
-    this.unitGroup = new THREE.Group();
-    this.routeGroup = new THREE.Group();
-    this.lensOverlayGroup = new THREE.Group();
-
-    this.scene.add(this.terrainGroup);
-    this.scene.add(this.settlementGroup);
-    this.scene.add(this.plotGroup);
-    this.scene.add(this.unitGroup);
-    this.scene.add(this.routeGroup);
-    this.scene.add(this.lensOverlayGroup);
-
-    this.pickables = [];
-    this.labelAnchors = []; // 用于投射屏幕 2D 浮动战略标牌
-    this.raycaster = new THREE.Raycaster();
-    this.mouse = new THREE.Vector2();
+    this.hoveredTile = null;
     this.keysPressed = new Set();
     this.isDragging = false;
-    this.dragButton = 0;
+    this.downMouse = null;
     this.lastMouse = { x: 0, y: 0 };
-    this.clock = new THREE.Clock();
+    this.animTime = 0;
 
+    // 预计算每个格子所属的最近城池 ID (用于 F2 政治疆域与 F3 控制度染色)
+    this.territoryOwnerGrid = null;
+
+    this._resizeCanvas();
     this._bindEvents();
-    this._updateCameraTransform();
     this._startLoop();
   }
 
-  /**
-   * 根据 GameState 初始化或刷新整个 2.5D 沙盘网格与实体
-   */
   syncState(state) {
     this.state = state;
-    if (!this.terrainBuilt) {
-      this._buildTerrainMesh(state);
-      this.terrainBuilt = true;
-    } else {
-      this._updateTerrainVertexColors(state);
-    }
-    this._rebuildSettlementsAndPlots(state);
-    this._rebuildUnitsAndRoutes(state);
-    this._rebuildLensOverlays(state);
+    this._computeTerritoryVoronoi(state);
   }
 
   setLensMode(mode) {
     this.lensMode = mode;
-    if (this.state) {
-      this._updateTerrainVertexColors(this.state);
-      this._rebuildLensOverlays(this.state);
-    }
   }
 
-  focusOnTile(x, y) {
-    this.target.set(x, 0, y);
-    this._updateCameraTransform();
+  focusOnTile(gx, gy) {
+    this.centerX = gx;
+    this.centerY = gy;
   }
 
-  rotateCamera(deltaYaw, deltaPitch = 0) {
-    this.yaw += deltaYaw;
-    this.pitch = Math.max(0.55, Math.min(1.28, this.pitch + deltaPitch));
-    this._updateCameraTransform();
+  zoomBy(factor) {
+    this.tileSize = Math.max(16, Math.min(68, this.tileSize * factor));
   }
 
   resetNorth() {
-    this.yaw = 0;
-    this.pitch = 0.92;
-    this._updateCameraTransform();
+    this.centerX = 32.5;
+    this.centerY = 23.5;
+    this.tileSize = 30;
+  }
+
+  rotateCamera(delta) {
+    // 兼容旧按钮调用：在 2D 平面模式下映射为缩放
+    this.zoomBy(delta < 0 ? 1.15 : 0.87);
+  }
+
+  getProjectedLabels() {
+    // 2D 平面模式下所有城池、内政建筑与部队兵牌直接在高分屏 Canvas 上原生绘制，无需额外 DOM 投影层
+    return [];
   }
 
   /**
-   * 构建 64x44 2.5D 高度图地形网格
+   * 计算每个网格点归属的最近据点 (半径 8.5 格以内)，并生成疆域边界
    */
-  _buildTerrainMesh(state) {
-    this.terrainGroup.clear();
-    const { width, height, elevation } = state.map;
-
-    const geom = new THREE.PlaneGeometry(width, height, width - 1, height - 1);
-    geom.rotateX(-Math.PI / 2);
-
-    const posAttr = geom.attributes.position;
-    const colors = new Float32Array(posAttr.count * 3);
-
-    for (let i = 0; i < posAttr.count; i++) {
-      // PlaneGeometry 顶点转网格坐标 (0..width-1, 0..height-1)
-      const vx = Math.min(width - 1, Math.max(0, Math.round(posAttr.getX(i) + width / 2)));
-      const vz = Math.min(height - 1, Math.max(0, Math.round(posAttr.getZ(i) + height / 2)));
-      const idx = vz * width + vx;
-      const h = elevation[idx] ?? 0.2;
-
-      posAttr.setX(i, vx);
-      posAttr.setY(i, h);
-      posAttr.setZ(i, vz);
-    }
-
-    geom.computeVertexNormals();
-    geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-
-    const mat = new THREE.MeshStandardMaterial({
-      vertexColors: true,
-      roughness: 0.82,
-      metalness: 0.08,
-      flatShading: true,
-    });
-
-    this.terrainMesh = new THREE.Mesh(geom, mat);
-    this.terrainMesh.receiveShadow = true;
-    this.terrainMesh.userData = { pickType: 'TERRAIN' };
-    this.terrainGroup.add(this.terrainMesh);
-
-    // 添加半透明黄河水面层
-    const waterGeom = new THREE.PlaneGeometry(width, height);
-    waterGeom.rotateX(-Math.PI / 2);
-    waterGeom.translate(width / 2 - 0.5, -0.08, height / 2 - 0.5);
-    const waterMat = new THREE.MeshStandardMaterial({
-      color: '#1d6fa5',
-      transparent: true,
-      opacity: 0.72,
-      roughness: 0.25,
-      metalness: 0.35,
-    });
-    this.waterMesh = new THREE.Mesh(waterGeom, waterMat);
-    this.terrainGroup.add(this.waterMesh);
-
-    this._updateTerrainVertexColors(state);
-  }
-
-  /**
-   * 根据当前激活的战略地图透镜 (F1~F5) 动态刷新地形顶点颜色
-   */
-  _updateTerrainVertexColors(state) {
-    if (!this.terrainMesh) return;
+  _computeTerritoryVoronoi(state) {
+    if (!state) return;
     const { width, height, terrain } = state.map;
-    const posAttr = this.terrainMesh.geometry.attributes.position;
-    const colorAttr = this.terrainMesh.geometry.attributes.color;
-    const c = new THREE.Color();
-
-    // 预备各据点领地归属查找 (7格半径 Voronoi 近似)
+    this.territorySettlementGrid = new Int16Array(width * height).fill(-1);
     const settlements = Object.values(state.settlements);
-    const findNearestSettlement = (x, z) => {
-      let best = null;
-      let bestDist = 9.5;
-      for (const s of settlements) {
-        const d = Math.hypot(s.x - x, s.y - z);
-        if (d < bestDist) {
-          bestDist = d;
-          best = s;
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = y * width + x;
+        if (terrain[idx] === TERRAIN_ENUM.WATER || terrain[idx] === TERRAIN_ENUM.CLIFF) continue;
+
+        let nearestId = -1;
+        let bestDist = 8.5;
+        for (const s of settlements) {
+          const weight = s.type === 'MAJOR_CITY' ? 1.0 : 1.35;
+          const d = Math.hypot(s.x - x, s.y - y) * weight;
+          if (d < bestDist) {
+            bestDist = d;
+            nearestId = s.id;
+          }
         }
+        this.territorySettlementGrid[idx] = nearestId;
       }
-      return best;
+    }
+  }
+
+  /**
+   * 屏幕像素坐标 (clientX, clientY) 转地图网格坐标 (gx, gy)
+   */
+  screenToGrid(clientX, clientY) {
+    const rect = this.canvas.getBoundingClientRect();
+    const sx = clientX - rect.left;
+    const sy = clientY - rect.top;
+    const w = rect.width;
+    const h = rect.height;
+
+    const gx = (sx - w / 2) / this.tileSize + this.centerX;
+    const gy = (sy - h / 2) / this.tileSize + this.centerY;
+    return {
+      gx: Math.floor(gx),
+      gy: Math.floor(gy),
+      exactX: gx,
+      exactY: gy,
+    };
+  }
+
+  /**
+   * 网格坐标 (gx, gy) 转画布中心像素坐标 (px, py)
+   */
+  gridToScreen(gx, gy, viewW, viewH) {
+    return {
+      x: (gx + 0.5 - this.centerX) * this.tileSize + viewW / 2,
+      y: (gy + 0.5 - this.centerY) * this.tileSize + viewH / 2,
+    };
+  }
+
+  _resizeCanvas() {
+    if (!this.container) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = this.container.clientWidth || window.innerWidth;
+    const h = this.container.clientHeight || window.innerHeight;
+    this.viewW = w;
+    this.viewH = h;
+    this.dpr = dpr;
+    this.canvas.width = Math.round(w * dpr);
+    this.canvas.height = Math.round(h * dpr);
+  }
+
+  /**
+   * 主渲染管线：按层绘制 2D 平面战略沙盘
+   */
+  _renderFrame() {
+    const state = this.state;
+    if (!state) return;
+
+    const ctx = this.ctx;
+    const w = this.viewW;
+    const h = this.viewH;
+    const ts = this.tileSize;
+
+    ctx.save();
+    ctx.scale(this.dpr, this.dpr);
+
+    // 背景深邃古卷底色
+    ctx.fillStyle = '#0c1322';
+    ctx.fillRect(0, 0, w, h);
+
+    const { width, height, terrain } = state.map;
+
+    // 计算当前视口可见的网格范围 (视锥体裁剪)
+    const minX = Math.max(0, Math.floor(this.centerX - w / (2 * ts) - 2));
+    const maxX = Math.min(width - 1, Math.ceil(this.centerX + w / (2 * ts) + 2));
+    const minY = Math.max(0, Math.floor(this.centerY - h / (2 * ts) - 2));
+    const maxY = Math.min(height - 1, Math.ceil(this.centerY + h / (2 * ts) + 2));
+
+    // ==================== 第一层：地形方格与 F1~F5 战略透镜底色 ====================
+    const tilePalette = {
+      [TERRAIN_ENUM.PLAIN]: '#3e5c38',
+      [TERRAIN_ENUM.ROAD]: '#7b6b4d',
+      [TERRAIN_ENUM.FOREST]: '#2a4728',
+      [TERRAIN_ENUM.MOUNTAIN]: '#57524a',
+      [TERRAIN_ENUM.CLIFF]: '#3b3631',
+      [TERRAIN_ENUM.WATER]: '#194a6e',
+      [TERRAIN_ENUM.FORD]: '#356d8a',
+      [TERRAIN_ENUM.MARSH]: '#365347',
     };
 
-    for (let i = 0; i < posAttr.count; i++) {
-      const vx = Math.min(width - 1, Math.max(0, Math.round(posAttr.getX(i))));
-      const vz = Math.min(height - 1, Math.max(0, Math.round(posAttr.getZ(i))));
-      const idx = vz * width + vx;
-      const t = terrain[idx];
-      const baseHex = TERRAIN_DEFS[t]?.color || '#5b7c47';
-      c.set(baseHex);
+    for (let gy = minY; gy <= maxY; gy++) {
+      for (let gx = minX; gx <= maxX; gx++) {
+        const idx = gy * width + gx;
+        const t = terrain[idx];
+        const px = (gx - this.centerX) * ts + w / 2;
+        const py = (gy - this.centerY) * ts + h / 2;
 
-      if (t !== TERRAIN_ENUM.WATER && this.lensMode !== 'TACTICAL') {
-        const nearest = findNearestSettlement(vx, vz);
-        if (nearest && nearest.factionId) {
+        // 基础地形色
+        ctx.fillStyle = tilePalette[t] || '#3e5c38';
+        ctx.fillRect(px, py, ts + 0.6, ts + 0.6);
+
+        // 战略透镜染色叠加 (F2 政治疆域 / F3 控制度热力图 / F4 人口密度 / F5 军需漕运网)
+        const ownerSettlementId = this.territorySettlementGrid ? this.territorySettlementGrid[idx] : -1;
+        const ownerSettlement = ownerSettlementId > 0 ? state.settlements[ownerSettlementId] : null;
+        const ownerFaction = ownerSettlement?.factionId ? state.factions[ownerSettlement.factionId] : null;
+
+        if (t !== TERRAIN_ENUM.WATER && ownerSettlement && ownerFaction) {
           if (this.lensMode === 'POLITICAL') {
-            const facColor = new THREE.Color(state.factions[nearest.factionId]?.color || '#64748b');
-            c.lerp(facColor, 0.58);
+            ctx.fillStyle = hexToRgba(ownerFaction.color, 0.44);
+            ctx.fillRect(px, py, ts + 0.5, ts + 0.5);
           } else if (this.lensMode === 'CONTROL_CLAN') {
-            // 控制度热力图：绿 (100%) -> 黄 (75%) -> 红 (<50%)
-            const ratio = Math.max(0, Math.min(1, (nearest.controlRate - 45) / 55));
-            const heatColor = new THREE.Color().setHSL(ratio * 0.33, 0.85, 0.42);
-            c.lerp(heatColor, 0.68);
-          } else if (this.lensMode === 'POPS_REFUGEE') {
-            const totalPops =
-              nearest.pops.freePeasants +
-              nearest.pops.clanRetainers +
-              nearest.pops.artisans;
-            const popRatio = Math.min(1, totalPops / 85000);
-            const popColor = new THREE.Color().setHSL(0.55 - popRatio * 0.4, 0.8, 0.45);
-            c.lerp(popColor, 0.55);
-          } else if (this.lensMode === 'LOGISTICS') {
-            if (t === TERRAIN_ENUM.ROAD || t === TERRAIN_ENUM.FORD) {
-              c.set('#fbbf24'); // 高亮帝国官道与漕运网
-            } else {
-              c.lerp(new THREE.Color('#1e293b'), 0.55);
-            }
+            const cRate = ownerSettlement.controlRate ?? 80;
+            const heatColor =
+              cRate >= 85
+                ? 'rgba(34, 197, 94, 0.42)'
+                : cRate >= 65
+                ? 'rgba(234, 179, 8, 0.42)'
+                : 'rgba(239, 68, 68, 0.48)';
+            ctx.fillStyle = heatColor;
+            ctx.fillRect(px, py, ts + 0.5, ts + 0.5);
+          } else if (this.lensMode === 'TACTICAL') {
+            // 战术模式下仅给领地涂一层极淡的势力归属色 (12% 透明度)
+            ctx.fillStyle = hexToRgba(ownerFaction.color, 0.12);
+            ctx.fillRect(px, py, ts + 0.5, ts + 0.5);
+          }
+        }
+
+        // 绘制地形细节纹理 (山形、林木、水纹、浅滩、官道)
+        if (ts >= 20) {
+          if (t === TERRAIN_ENUM.MOUNTAIN || t === TERRAIN_ENUM.CLIFF) {
+            this._drawMountainIcon(ctx, px, py, ts, t === TERRAIN_ENUM.CLIFF);
+          } else if (t === TERRAIN_ENUM.FOREST) {
+            this._drawForestIcon(ctx, px, py, ts);
+          } else if (t === TERRAIN_ENUM.WATER) {
+            this._drawWaterWave(ctx, px, py, ts, gx, gy);
+          } else if (t === TERRAIN_ENUM.FORD) {
+            this._drawFordSteppingStones(ctx, px, py, ts);
+          } else if (t === TERRAIN_ENUM.ROAD) {
+            ctx.strokeStyle = 'rgba(234, 214, 172, 0.42)';
+            ctx.lineWidth = Math.max(1, ts * 0.08);
+            ctx.strokeRect(px + ts * 0.25, py + ts * 0.25, ts * 0.5, ts * 0.5);
+          }
+        }
+
+        // 棋盘细网格线
+        if (ts >= 22) {
+          ctx.strokeStyle = 'rgba(15, 23, 42, 0.22)';
+          ctx.lineWidth = 0.75;
+          ctx.strokeRect(px, py, ts, ts);
+        }
+
+        // 绘制不同据点领地之间的分界线
+        if (ownerSettlementId > 0 && this.territorySettlementGrid) {
+          const rightOwner = gx + 1 < width ? this.territorySettlementGrid[gy * width + (gx + 1)] : ownerSettlementId;
+          const downOwner = gy + 1 < height ? this.territorySettlementGrid[(gy + 1) * width + gx] : ownerSettlementId;
+          ctx.strokeStyle = ownerFaction ? hexToRgba(ownerFaction.color, 0.65) : 'rgba(148,163,184,0.4)';
+          ctx.lineWidth = 1.5;
+          if (rightOwner !== ownerSettlementId && rightOwner > 0) {
+            ctx.beginPath();
+            ctx.moveTo(px + ts, py);
+            ctx.lineTo(px + ts, py + ts);
+            ctx.stroke();
+          }
+          if (downOwner !== ownerSettlementId && downOwner > 0) {
+            ctx.beginPath();
+            ctx.moveTo(px, py + ts);
+            ctx.lineTo(px + ts, py + ts);
+            ctx.stroke();
           }
         }
       }
-
-      colorAttr.setXYZ(i, c.r, c.g, c.b);
     }
 
-    colorAttr.needsUpdate = true;
+    // ==================== 第二层：山川地理书法标注 ====================
+    if (ts >= 20) {
+      this._drawGeoWatermark(ctx, '黄 河 九 曲', 26, 19, '#7dd3fc', w, h);
+      this._drawGeoWatermark(ctx, '太 行 山 脉', 23, 12, '#cbd5e1', w, h);
+      this._drawGeoWatermark(ctx, '嵩 山 天 险', 28, 27, '#cbd5e1', w, h);
+      this._drawGeoWatermark(ctx, '崤 山 · 函 谷', 14, 28, '#cbd5e1', w, h);
+      this._drawGeoWatermark(ctx, '淮 水 流 域', 42, 38, '#7dd3fc', w, h);
+    }
+
+    // ==================== 第三层：F5 军需漕运网干线与动态运粮流向 ====================
+    this._drawLogisticsConnections(ctx, state, w, h);
+
+    // ==================== 第四层：大地图 Lv1~Lv3 内政建筑与野外军事设施 ====================
+    this._drawEconomicPlotsAndFacilities(ctx, state, w, h);
+
+    // ==================== 第五层：12 座都市与 6 座咽喉关港 ====================
+    this._drawSettlements(ctx, state, w, h);
+
+    // ==================== 第六层：部队行军路线虚线箭头与五将战术兵牌 ====================
+    this._drawUnitsAndMarchRoutes(ctx, state, w, h);
+
+    // ==================== 第七层：鼠标悬停格子高亮与浮窗提示 ====================
+    if (this.hoveredTile) {
+      const { gx, gy } = this.hoveredTile;
+      if (gx >= 0 && gx < width && gy >= 0 && gy < height) {
+        const px = (gx - this.centerX) * ts + w / 2;
+        const py = (gy - this.centerY) * ts + h / 2;
+        ctx.strokeStyle = '#fde047';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(px + 1, py + 1, ts - 2, ts - 2);
+      }
+    }
+
+    ctx.restore();
+  }
+
+  _drawMountainIcon(ctx, px, py, ts, isCliff) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(px + ts * 0.15, py + ts * 0.82);
+    ctx.lineTo(px + ts * 0.5, py + ts * (isCliff ? 0.14 : 0.24));
+    ctx.lineTo(px + ts * 0.85, py + ts * 0.82);
+    ctx.closePath();
+    ctx.fillStyle = isCliff ? '#292524' : '#44403c';
+    ctx.fill();
+    ctx.strokeStyle = isCliff ? '#a8a29e' : '#78716c';
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+
+    // 山巅高光
+    if (isCliff) {
+      ctx.beginPath();
+      ctx.moveTo(px + ts * 0.38, py + ts * 0.38);
+      ctx.lineTo(px + ts * 0.5, py + ts * 0.14);
+      ctx.lineTo(px + ts * 0.62, py + ts * 0.38);
+      ctx.fillStyle = '#d6d3d1';
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  _drawForestIcon(ctx, px, py, ts) {
+    ctx.save();
+    ctx.fillStyle = '#1e3a1e';
+    ctx.beginPath();
+    ctx.arc(px + ts * 0.38, py + ts * 0.45, ts * 0.22, 0, Math.PI * 2);
+    ctx.arc(px + ts * 0.64, py + ts * 0.52, ts * 0.2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  _drawWaterWave(ctx, px, py, ts, gx, gy) {
+    ctx.save();
+    const offset = Math.sin(this.animTime * 2 + gx * 0.7 + gy * 0.5) * 2;
+    ctx.strokeStyle = 'rgba(125, 211, 252, 0.35)';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(px + ts * 0.2 + offset, py + ts * 0.5);
+    ctx.quadraticCurveTo(px + ts * 0.5, py + ts * 0.35, px + ts * 0.8 + offset, py + ts * 0.5);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  _drawFordSteppingStones(ctx, px, py, ts) {
+    ctx.save();
+    ctx.fillStyle = '#fde68a';
+    for (let i = 0; i < 3; i++) {
+      ctx.beginPath();
+      ctx.arc(px + ts * (0.28 + i * 0.22), py + ts * 0.5, Math.max(2, ts * 0.08), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  _drawGeoWatermark(ctx, text, gx, gy, color, viewW, viewH) {
+    const p = this.gridToScreen(gx, gy, viewW, viewH);
+    ctx.save();
+    ctx.font = `bold ${Math.max(11, Math.round(this.tileSize * 0.42))}px "Songti SC", "Noto Serif SC", serif`;
+    ctx.fillStyle = hexToRgba(color, 0.35);
+    ctx.textAlign = 'center';
+    ctx.fillText(text, p.x, p.y);
+    ctx.restore();
   }
 
   /**
-   * 构建 12 座都市、6 座关港、大地图 Lv1~Lv3 内政建筑与野外军事设施
+   * 绘制据点之间的连通干线与 F5 军需漕运网动态流向
    */
-  _rebuildSettlementsAndPlots(state) {
-    this.settlementGroup.clear();
-    this.plotGroup.clear();
-    this.pickables = [this.terrainMesh];
-    this.labelAnchors = [];
+  _drawLogisticsConnections(ctx, state, viewW, viewH) {
+    const drawn = new Set();
+    const isLogisticsLens = this.lensMode === 'LOGISTICS';
 
-    // 1. 渲染据点 (都市 / 关隘 / 港口)
     for (const s of Object.values(state.settlements)) {
-      const faction = s.factionId ? state.factions[s.factionId] : null;
-      const facColor = faction ? faction.color : '#94a3b8';
-      const isSelected = this.selectedSettlementId === s.id;
+      const p1 = this.gridToScreen(s.x, s.y, viewW, viewH);
+      for (const nId of s.connectedSettlementIds || []) {
+        const key = s.id < nId ? `${s.id}-${nId}` : `${nId}-${s.id}`;
+        if (drawn.has(key)) continue;
+        drawn.add(key);
 
-      const group = new THREE.Group();
-      const tileH = state.map.elevation[s.y * state.map.width + s.x] ?? 0.28;
-      group.position.set(s.x, tileH, s.y);
+        const target = state.settlements[nId];
+        if (!target) continue;
+        const p2 = this.gridToScreen(target.x, target.y, viewW, viewH);
+        const sameFaction = s.factionId && s.factionId === target.factionId;
 
-      if (s.type === 'MAJOR_CITY') {
-        // 大都市：双层城垣 + 中央主殿
-        const wallMesh = new THREE.Mesh(
-          new THREE.BoxGeometry(1.55, 0.65, 1.55),
-          new THREE.MeshStandardMaterial({ color: '#cbd5e1', roughness: 0.7 })
-        );
-        wallMesh.position.y = 0.32;
-        wallMesh.castShadow = true;
-        wallMesh.userData = { pickType: 'SETTLEMENT', id: s.id };
-        this.pickables.push(wallMesh);
-        group.add(wallMesh);
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
 
-        const keepMesh = new THREE.Mesh(
-          new THREE.ConeGeometry(0.92, 0.75, 4),
-          new THREE.MeshStandardMaterial({ color: facColor, roughness: 0.45 })
-        );
-        keepMesh.rotation.y = Math.PI / 4;
-        keepMesh.position.y = 0.95;
-        group.add(keepMesh);
-      } else if (s.type === 'PASS') {
-        // 险要关隘 (虎牢关/潼关/壶关)：横跨隘口的雄关城楼
-        const passMesh = new THREE.Mesh(
-          new THREE.BoxGeometry(1.35, 0.85, 0.95),
-          new THREE.MeshStandardMaterial({ color: '#94a3b8', roughness: 0.6 })
-        );
-        passMesh.position.y = 0.42;
-        passMesh.userData = { pickType: 'SETTLEMENT', id: s.id };
-        this.pickables.push(passMesh);
-        group.add(passMesh);
-
-        const roof = new THREE.Mesh(
-          new THREE.BoxGeometry(1.45, 0.25, 1.05),
-          new THREE.MeshStandardMaterial({ color: facColor })
-        );
-        roof.position.y = 0.92;
-        group.add(roof);
-      } else {
-        // 渡口军港 (官渡港/白马港/延津港)
-        const dockMesh = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.68, 0.78, 0.5, 6),
-          new THREE.MeshStandardMaterial({ color: facColor, roughness: 0.5 })
-        );
-        dockMesh.position.y = 0.25;
-        dockMesh.userData = { pickType: 'SETTLEMENT', id: s.id };
-        this.pickables.push(dockMesh);
-        group.add(dockMesh);
+        if (isLogisticsLens) {
+          ctx.strokeStyle = sameFaction ? '#fbbf24' : 'rgba(148, 163, 184, 0.35)';
+          ctx.lineWidth = sameFaction ? 3 : 1.5;
+          ctx.setLineDash(sameFaction ? [8, 6] : [4, 4]);
+          ctx.lineDashOffset = -this.animTime * 24;
+        } else {
+          ctx.strokeStyle = 'rgba(217, 179, 108, 0.25)';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([4, 4]);
+        }
+        ctx.stroke();
+        ctx.restore();
       }
+    }
+  }
 
-      // 选中高亮光环
-      if (isSelected) {
-        const ring = new THREE.Mesh(
-          new THREE.RingGeometry(1.05, 1.32, 32),
-          new THREE.MeshBasicMaterial({ color: '#fde047', side: THREE.DoubleSide })
-        );
-        ring.rotation.x = -Math.PI / 2;
-        ring.position.y = 0.06;
-        group.add(ring);
-      }
+  /**
+   * 绘制城外 Lv1~Lv3 大地图内政建筑与野外军事设施
+   */
+  _drawEconomicPlotsAndFacilities(ctx, state, viewW, viewH) {
+    const ts = this.tileSize;
+    const plotColors = {
+      FARM: '#4d7c0f',
+      MARKET: '#b45309',
+      BARRACKS: '#b91c1c',
+      SMITHY: '#c2410c',
+      STABLE: '#7e22ce',
+      WORKSHOP: '#0e7490',
+    };
 
-      this.settlementGroup.add(group);
+    for (const s of Object.values(state.settlements)) {
+      const cityScreen = this.gridToScreen(s.x, s.y, viewW, viewH);
 
-      this.labelAnchors.push({
-        kind: 'SETTLEMENT',
-        id: s.id,
-        worldPos: new THREE.Vector3(s.x, tileH + 1.45, s.y),
-        data: s,
-        faction,
-        isSelected,
-      });
-
-      // 2. 渲染该城下辖的大地图 Lv1~Lv3 内政建筑
       for (const plot of s.economicPlots || []) {
-        const ph = state.map.elevation[plot.y * state.map.width + plot.x] ?? 0.26;
-        const pGroup = new THREE.Group();
-        pGroup.position.set(plot.x, ph, plot.y);
+        const pos = this.gridToScreen(plot.x, plot.y, viewW, viewH);
+        const def = ECONOMIC_BUILDING_DEFS[plot.type];
+        const bg = plotColors[plot.type] || '#334155';
 
-        const plotColors = {
-          FARM: '#65a30d',
-          MARKET: '#eab308',
-          BARRACKS: '#ef4444',
-          SMITHY: '#f97316',
-          STABLE: '#a855f7',
-          WORKSHOP: '#06b6d4',
-        };
-        const pColor = plotColors[plot.type] || '#94a3b8';
-        const hScale = 0.18 + plot.level * 0.11;
+        // 细虚线连接所属母城
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(cityScreen.x, cityScreen.y);
+        ctx.lineTo(pos.x, pos.y);
+        ctx.strokeStyle = 'rgba(251, 191, 36, 0.22)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
 
-        const baseBlock = new THREE.Mesh(
-          new THREE.BoxGeometry(0.68, hScale, 0.68),
-          new THREE.MeshStandardMaterial({ color: pColor, roughness: 0.6 })
-        );
-        baseBlock.position.y = hScale / 2;
-        baseBlock.userData = { pickType: 'SETTLEMENT', id: s.id };
-        this.pickables.push(baseBlock);
-        pGroup.add(baseBlock);
+        // 内政用地小方牌
+        const boxR = Math.max(9, ts * 0.38);
+        ctx.fillStyle = bg;
+        ctx.strokeStyle = plot.level === 3 ? '#fde047' : '#cbd5e1';
+        ctx.lineWidth = plot.level === 3 ? 2 : 1.2;
+        roundRect(ctx, pos.x - boxR, pos.y - boxR, boxR * 2, boxR * 2, 4);
+        ctx.fill();
+        ctx.stroke();
 
-        this.plotGroup.add(pGroup);
+        if (ts >= 22) {
+          ctx.font = `${Math.max(10, Math.round(ts * 0.38))}px sans-serif`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillStyle = '#ffffff';
+          ctx.fillText(def?.icon || '🏠', pos.x, pos.y - 1);
 
-        this.labelAnchors.push({
-          kind: 'PLOT',
-          id: plot.id,
-          worldPos: new THREE.Vector3(plot.x, ph + hScale + 0.35, plot.y),
-          data: plot,
-          def: ECONOMIC_BUILDING_DEFS[plot.type],
-        });
+          // 等级角标 Lv1~Lv3
+          ctx.font = `bold ${Math.max(8, Math.round(ts * 0.25))}px monospace`;
+          ctx.fillStyle = '#fef08a';
+          ctx.fillText(`Lv${plot.level}`, pos.x, pos.y + boxR + 7);
+        }
+        ctx.restore();
       }
     }
 
-    // 3. 渲染野外军事设施 (连弩橹 / 前哨阵)
+    // 野外军事设施 (连弩橹 / 前哨阵)
     for (const fac of Object.values(state.facilities || {})) {
       if (fac.durability <= 0) continue;
-      const fh = state.map.elevation[fac.y * state.map.width + fac.x] ?? 0.3;
-      const fGroup = new THREE.Group();
-      fGroup.position.set(fac.x, fh, fac.y);
-      const facColor = state.factions[fac.factionId]?.color || '#cbd5e1';
+      const pos = this.gridToScreen(fac.x, fac.y, viewW, viewH);
+      const facColor = state.factions[fac.factionId]?.color || '#f59e0b';
+      const r = Math.max(9, ts * 0.38);
 
-      const towerMesh = new THREE.Mesh(
-        new THREE.ConeGeometry(0.45, 0.85, 6),
-        new THREE.MeshStandardMaterial({ color: facColor })
-      );
-      towerMesh.position.y = 0.42;
-      fGroup.add(towerMesh);
-      this.plotGroup.add(fGroup);
+      ctx.save();
+      ctx.fillStyle = '#1e293b';
+      ctx.strokeStyle = facColor;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
 
-      this.labelAnchors.push({
-        kind: 'FACILITY',
-        id: fac.id,
-        worldPos: new THREE.Vector3(fac.x, fh + 1.0, fac.y),
-        data: fac,
-      });
+      ctx.font = `${Math.max(10, Math.round(ts * 0.36))}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(fac.type === 'TOWER' ? '🏹' : '⛺', pos.x, pos.y);
+
+      if (ts >= 24) {
+        ctx.font = 'bold 10px sans-serif';
+        ctx.fillStyle = '#fde68a';
+        ctx.fillText(fac.name, pos.x, pos.y + r + 9);
+      }
+      ctx.restore();
     }
   }
 
   /**
-   * 渲染野外作战部队立体兵棋 (Wargame Token) 与动态行军路线箭头
+   * 绘制 12 座核心都市与 6 座咽喉关隘/黄河渡口
    */
-  _rebuildUnitsAndRoutes(state) {
-    this.unitGroup.clear();
-    this.routeGroup.clear();
+  _drawSettlements(ctx, state, viewW, viewH) {
+    const ts = this.tileSize;
 
-    for (const u of Object.values(state.units)) {
-      const faction = state.factions[u.factionId];
-      const facColor = faction ? faction.color : '#3b82f6';
-      const uh = state.map.elevation[u.y * state.map.width + u.x] ?? 0.3;
-      const isSelected = this.selectedUnitId === u.id;
+    for (const s of Object.values(state.settlements)) {
+      const pos = this.gridToScreen(s.x, s.y, viewW, viewH);
+      const faction = s.factionId ? state.factions[s.factionId] : null;
+      const facColor = faction ? faction.color : '#64748b';
+      const isSelected = this.selectedSettlementId === s.id;
 
-      const uGroup = new THREE.Group();
-      uGroup.position.set(u.x, uh, u.y);
+      ctx.save();
 
-      // 立体八角战术兵牌底座
-      const tokenMesh = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.58, 0.65, 0.32, 8),
-        new THREE.MeshStandardMaterial({
-          color: facColor,
-          roughness: 0.35,
-          metalness: 0.25,
-        })
-      );
-      tokenMesh.position.y = 0.22;
-      tokenMesh.castShadow = true;
-      tokenMesh.userData = { pickType: 'UNIT', id: u.id };
-      this.pickables.push(tokenMesh);
-      uGroup.add(tokenMesh);
-
-      // 帅旗旗杆
-      const pole = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.04, 0.04, 1.05, 6),
-        new THREE.MeshBasicMaterial({ color: '#fef08a' })
-      );
-      pole.position.set(0.25, 0.6, 0);
-      uGroup.add(pole);
-
+      // 选中城池时绘制 ZOC 控制范围圈與呼吸高亮光环
       if (isSelected) {
-        const ring = new THREE.Mesh(
-          new THREE.RingGeometry(0.72, 0.92, 24),
-          new THREE.MeshBasicMaterial({ color: '#38bdf8', side: THREE.DoubleSide })
-        );
-        ring.rotation.x = -Math.PI / 2;
-        ring.position.y = 0.06;
-        uGroup.add(ring);
+        ctx.strokeStyle = 'rgba(250, 204, 21, 0.35)';
+        ctx.fillStyle = 'rgba(250, 204, 21, 0.06)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([5, 4]);
+        const zocPx = (s.zocRadius + 0.5) * ts * 2;
+        ctx.strokeRect(pos.x - zocPx / 2, pos.y - zocPx / 2, zocPx, zocPx);
+        ctx.fillRect(pos.x - zocPx / 2, pos.y - zocPx / 2, zocPx, zocPx);
+        ctx.setLineDash([]);
       }
 
-      this.unitGroup.add(uGroup);
+      const r = s.type === 'MAJOR_CITY' ? Math.max(14, ts * 0.58) : Math.max(11, ts * 0.45);
 
+      if (s.type === 'MAJOR_CITY') {
+        // 大都市：古典双层方形城池城郭
+        ctx.fillStyle = '#1e293b';
+        ctx.strokeStyle = isSelected ? '#fde047' : '#e2e8f0';
+        ctx.lineWidth = isSelected ? 3 : 2;
+        roundRect(ctx, pos.x - r, pos.y - r, r * 2, r * 2, 4);
+        ctx.fill();
+        ctx.stroke();
+
+        // 内城势力主殿色块
+        ctx.fillStyle = facColor;
+        roundRect(ctx, pos.x - r * 0.68, pos.y - r * 0.68, r * 1.36, r * 1.36, 2);
+        ctx.fill();
+
+        // 中央势力汉字徽记
+        ctx.font = `900 ${Math.max(11, Math.round(r * 0.92))}px "Songti SC", serif`;
+        ctx.fillStyle = '#ffffff';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(faction?.bannerChar || '城', pos.x, pos.y + 1);
+      } else if (s.type === 'PASS') {
+        // 险要关隘 (虎牢关/潼关/壶关)：八角雄关图案
+        ctx.fillStyle = '#334155';
+        ctx.strokeStyle = isSelected ? '#fde047' : facColor;
+        ctx.lineWidth = isSelected ? 3 : 2.2;
+        roundRect(ctx, pos.x - r * 1.15, pos.y - r * 0.85, r * 2.3, r * 1.7, 3);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.font = `bold ${Math.max(10, Math.round(r * 0.8))}px sans-serif`;
+        ctx.fillStyle = '#fef08a';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('⛩️', pos.x, pos.y);
+      } else {
+        // 战略军港 (官渡港/白马港/延津港)：圆形水寨
+        ctx.fillStyle = '#0f172a';
+        ctx.strokeStyle = isSelected ? '#fde047' : facColor;
+        ctx.lineWidth = isSelected ? 3 : 2.2;
+        ctx.beginPath();
+        ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.font = `${Math.max(10, Math.round(r * 0.85))}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('⚓', pos.x, pos.y);
+      }
+
+      // 城池顶部铭牌：[城名 | 兵力 | レンズ附加信息]
+      const labelText = `${s.name}`;
+      const troopText = `${(s.troops / 1000).toFixed(1)}k`;
+      ctx.font = 'bold 12px "PingFang SC", sans-serif';
+      const labelW = Math.max(76, ctx.measureText(labelText + troopText).width + 26);
+      const labelH = 20;
+      const lx = pos.x - labelW / 2;
+      const ly = pos.y - r - labelH - 5;
+
+      ctx.fillStyle = isSelected ? 'rgba(15, 23, 42, 0.96)' : 'rgba(15, 23, 42, 0.88)';
+      ctx.strokeStyle = isSelected ? '#facc15' : facColor;
+      ctx.lineWidth = isSelected ? 2 : 1.2;
+      roundRect(ctx, lx, ly, labelW, labelH, 4);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#fef3c7';
+      ctx.fillText(labelText, lx + 6, ly + labelH / 2);
+
+      ctx.textAlign = 'right';
+      ctx.font = 'bold 11px monospace';
+      ctx.fillStyle = '#38bdf8';
+      ctx.fillText(troopText, lx + labelW - 6, ly + labelH / 2);
+
+      // 城防耐久与兵粮士气细条
+      const barW = r * 2;
+      const wallPct = Math.max(0, Math.min(1, s.wallDurability / s.maxWallDurability));
+      ctx.fillStyle = 'rgba(15,23,42,0.85)';
+      ctx.fillRect(pos.x - r, pos.y + r + 3, barW, 4);
+      ctx.fillStyle = wallPct > 0.5 ? '#22c55e' : '#ef4444';
+      ctx.fillRect(pos.x - r, pos.y + r + 3, barW * wallPct, 4);
+
+      // 战略透镜专属附加标签
+      if (this.lensMode === 'CONTROL_CLAN') {
+        const clanName = s.dominantClanId ? state.clans[s.dominantClanId]?.name.split('·')[0] : '';
+        ctx.font = 'bold 10px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = s.controlRate >= 85 ? '#4ade80' : '#facc15';
+        ctx.fillText(`控制度:${s.controlRate}% ${clanName}`, pos.x, pos.y + r + 16);
+      } else if (this.lensMode === 'POPS_REFUGEE') {
+        // 绘制自耕农(绿) / 世家部曲(金) / 流民(红) 迷你柱状图
+        const bars = [
+          { val: s.pops.freePeasants, color: '#22c55e', dx: -12 },
+          { val: s.pops.clanRetainers, color: '#eab308', dx: 0 },
+          { val: s.pops.refugees, color: '#ef4444', dx: 12 },
+        ];
+        for (const b of bars) {
+          const bh = Math.min(34, Math.max(4, Math.round(b.val / 1500)));
+          ctx.fillStyle = b.color;
+          ctx.fillRect(pos.x + b.dx - 4, ly - bh - 3, 8, bh);
+        }
+      } else if (this.lensMode === 'LOGISTICS') {
+        const roleTag =
+          s.logisticsRole === 'REAR_SUPPLY'
+            ? '📦后方供应基地'
+            : s.logisticsRole === 'FRONTLINE_DEMAND'
+            ? '⚔️前线重点军镇'
+            : '⚖️中转据点';
+        ctx.font = 'bold 10px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#fde047';
+        ctx.fillText(roleTag, pos.x, pos.y + r + 16);
+      }
+
+      ctx.restore();
+    }
+  }
+
+  /**
+   * 绘制野外五将部队兵牌与动态行军路线箭头
+   */
+  _drawUnitsAndMarchRoutes(ctx, state, viewW, viewH) {
+    const ts = this.tileSize;
+
+    // 1. 先绘制行军路线虚线与目标准星
+    for (const u of Object.values(state.units)) {
+      const fac = state.factions[u.factionId];
+      const facColor = fac ? fac.color : '#3b82f6';
+      const isSelected = this.selectedUnitId === u.id;
+
+      if (u.order?.path && u.order.path.length > 0) {
+        ctx.save();
+        const startPos = this.gridToScreen(u.x, u.y, viewW, viewH);
+        ctx.beginPath();
+        ctx.moveTo(startPos.x, startPos.y);
+        for (const [px, py] of u.order.path) {
+          const pt = this.gridToScreen(px, py, viewW, viewH);
+          ctx.lineTo(pt.x, pt.y);
+        }
+        ctx.strokeStyle = isSelected ? '#38bdf8' : facColor;
+        ctx.lineWidth = isSelected ? 3.2 : 2.2;
+        ctx.setLineDash([7, 5]);
+        ctx.lineDashOffset = -this.animTime * 28;
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // 终点准星圆环
+        const last = u.order.path[u.order.path.length - 1];
+        const endPos = this.gridToScreen(last[0], last[1], viewW, viewH);
+        ctx.beginPath();
+        ctx.arc(endPos.x, endPos.y, 6, 0, Math.PI * 2);
+        ctx.fillStyle = isSelected ? '#38bdf8' : facColor;
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    // 2. 绘制五将战术兵牌 (Wargame Counter)
+    for (const u of Object.values(state.units)) {
+      const pos = this.gridToScreen(u.x, u.y, viewW, viewH);
+      const fac = state.factions[u.factionId];
+      const facColor = fac ? fac.color : '#3b82f6';
+      const isSelected = this.selectedUnitId === u.id;
       const cmdOfficer = state.officers[u.slots[0]?.officerId];
       const formDef = FORMATIONS[u.formationId] || FORMATIONS.FISH_SCALE;
 
-      this.labelAnchors.push({
-        kind: 'UNIT',
-        id: u.id,
-        worldPos: new THREE.Vector3(u.x, uh + 1.15, u.y),
-        data: u,
-        commanderName: cmdOfficer ? cmdOfficer.name : `部队#${u.id}`,
-        formDef,
-        faction,
-        isSelected,
-      });
+      ctx.save();
 
-      // 绘制部队行军路线箭头
-      if (u.order?.path && u.order.path.length > 0) {
-        const points = [new THREE.Vector3(u.x, uh + 0.18, u.y)];
-        for (const [px, py] of u.order.path) {
-          const ph = state.map.elevation[py * state.map.width + px] ?? 0.3;
-          points.push(new THREE.Vector3(px, ph + 0.18, py));
-        }
-        const lineGeom = new THREE.BufferGeometry().setFromPoints(points);
-        const lineMat = new THREE.LineBasicMaterial({
-          color: isSelected ? '#38bdf8' : facColor,
-          linewidth: 2,
-        });
-        const line = new THREE.Line(lineGeom, lineMat);
-        this.routeGroup.add(line);
+      const cardW = Math.max(76, ts * 2.35);
+      const cardH = Math.max(34, ts * 1.15);
+      const cx = pos.x - cardW / 2;
+      const cy = pos.y - cardH / 2;
+
+      // 兵牌阴影与背景
+      ctx.shadowColor = 'rgba(0,0,0,0.65)';
+      ctx.shadowBlur = 8;
+      ctx.fillStyle = '#0f172a';
+      ctx.strokeStyle = isSelected ? '#38bdf8' : facColor;
+      ctx.lineWidth = isSelected ? 3 : 2;
+      roundRect(ctx, cx, cy, cardW, cardH, 6);
+      ctx.fill();
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      // 左侧势力色条
+      ctx.fillStyle = facColor;
+      roundRect(ctx, cx + 2, cy + 2, 18, cardH - 4, 4);
+      ctx.fill();
+
+      ctx.font = 'bold 11px serif';
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(fac?.bannerChar || '军', cx + 11, cy + cardH / 2);
+
+      // 兵牌第一行：阵型符号 + 主将名 + 阵型名
+      ctx.textAlign = 'left';
+      ctx.font = 'bold 11px "PingFang SC", sans-serif';
+      ctx.fillStyle = '#fef08a';
+      ctx.fillText(
+        `${formDef.symbol}${cmdOfficer ? cmdOfficer.name : '部队'} [${formDef.name}]`,
+        cx + 24,
+        cy + cardH * 0.34
+      );
+
+      // 兵牌第二行：兵力 + 士气
+      ctx.font = 'bold 10px monospace';
+      ctx.fillStyle = '#7dd3fc';
+      ctx.fillText(`${u.troops.toLocaleString()}兵`, cx + 24, cy + cardH * 0.72);
+
+      ctx.textAlign = 'right';
+      ctx.fillStyle = u.morale < 35 ? '#f87171' : '#4ade80';
+      ctx.fillText(`士${u.morale}`, cx + cardW - 6, cy + cardH * 0.72);
+
+      // CK3 状态角标 (死敌血战 / 混乱)
+      if (u.statusEffect === 'BLOOD_FEUD_RAGE') {
+        ctx.fillStyle = '#dc2626';
+        roundRect(ctx, pos.x - 32, cy - 15, 64, 13, 3);
+        ctx.fill();
+        ctx.font = 'bold 9px sans-serif';
+        ctx.fillStyle = '#ffffff';
+        ctx.textAlign = 'center';
+        ctx.fillText('💢死敌血战', pos.x, cy - 8.5);
+      } else if (u.statusEffect === 'CONFUSED') {
+        ctx.fillStyle = '#7e22ce';
+        roundRect(ctx, pos.x - 28, cy - 15, 56, 13, 3);
+        ctx.fill();
+        ctx.font = 'bold 9px sans-serif';
+        ctx.fillStyle = '#ffffff';
+        ctx.textAlign = 'center';
+        ctx.fillText('💫混乱中', pos.x, cy - 8.5);
       }
-    }
-  }
 
-  /**
-   * 渲染战略地图透镜专属 3D 辅助图层 (如 F4 四阶人口柱状图、F5 军需漕运网连接线)
-   */
-  _rebuildLensOverlays(state) {
-    this.lensOverlayGroup.clear();
-    if (!state) return;
+      // 兵法发动与 2~5 联动飘字横幅
+      if (u.lastTacticBanner) {
+        const bannerText = `⚡ ${u.lastTacticBanner.text} (-${u.lastTacticBanner.damage})`;
+        ctx.font = 'bold 11px "PingFang SC", sans-serif';
+        const bw = ctx.measureText(bannerText).width + 16;
+        const bx = pos.x - bw / 2;
+        const by = cy - 32;
+        ctx.fillStyle = '#b91c1c';
+        ctx.strokeStyle = '#fde047';
+        ctx.lineWidth = 1.5;
+        roundRect(ctx, bx, by, bw, 18, 4);
+        ctx.fill();
+        ctx.stroke();
 
-    if (this.lensMode === 'POPS_REFUGEE') {
-      // 在每座城市上方升起自耕农(绿) / 世家部曲(金) / 流民(红) 3D 柱状图
-      for (const s of Object.values(state.settlements)) {
-        const sh = state.map.elevation[s.y * state.map.width + s.x] ?? 0.3;
-        const bars = [
-          { val: s.pops.freePeasants, color: '#22c55e', dx: -0.45 },
-          { val: s.pops.clanRetainers, color: '#eab308', dx: 0 },
-          { val: s.pops.refugees, color: '#ef4444', dx: 0.45 },
-        ];
-        for (const b of bars) {
-          const h = Math.max(0.25, (b.val / 15000) * 1.1);
-          const mesh = new THREE.Mesh(
-            new THREE.BoxGeometry(0.32, h, 0.32),
-            new THREE.MeshStandardMaterial({ color: b.color })
-          );
-          mesh.position.set(s.x + b.dx, sh + 1.1 + h / 2, s.y);
-          this.lensOverlayGroup.add(mesh);
-        }
+        ctx.fillStyle = '#fef08a';
+        ctx.textAlign = 'center';
+        ctx.fillText(bannerText, pos.x, by + 9.5);
       }
-    } else if (this.lensMode === 'LOGISTICS') {
-      // 绘制连通的军需漕运干线
-      const drawn = new Set();
-      for (const s of Object.values(state.settlements)) {
-        for (const nId of s.connectedSettlementIds || []) {
-          const key = s.id < nId ? `${s.id}-${nId}` : `${nId}-${s.id}`;
-          if (drawn.has(key)) continue;
-          drawn.add(key);
-          const target = state.settlements[nId];
-          if (!target) continue;
-          const sameFaction = s.factionId && s.factionId === target.factionId;
-          const p1 = new THREE.Vector3(s.x, 0.55, s.y);
-          const p2 = new THREE.Vector3(target.x, 0.55, target.y);
-          const geom = new THREE.BufferGeometry().setFromPoints([p1, p2]);
-          const mat = new THREE.LineBasicMaterial({
-            color: sameFaction ? '#fbbf24' : '#475569',
-          });
-          this.lensOverlayGroup.add(new THREE.Line(geom, mat));
-        }
-      }
+
+      ctx.restore();
     }
-  }
-
-  /**
-   * 计算所有 3D 锚点在当前屏幕上的 2D 像素坐标，供 React 浮层绘制清晰兵牌与城池标签
-   */
-  getProjectedLabels() {
-    if (!this.container) return [];
-    const width = this.container.clientWidth;
-    const height = this.container.clientHeight;
-    const result = [];
-
-    for (const item of this.labelAnchors) {
-      // 内政建筑仅在相机拉近 (distance <= 52) 时显示文字标签，保持远景清爽
-      if (item.kind === 'PLOT' && this.distance > 52) continue;
-
-      const v = item.worldPos.clone().project(this.camera);
-      if (v.z > 1) continue; // 在相机背面
-      const x = (v.x * 0.5 + 0.5) * width;
-      const y = (-(v.y * 0.5) + 0.5) * height;
-      if (x < -80 || x > width + 80 || y < -80 || y > height + 80) continue;
-
-      result.push({
-        ...item,
-        screenX: Math.round(x),
-        screenY: Math.round(y),
-      });
-    }
-    return result;
-  }
-
-  _updateCameraTransform() {
-    const horizDist = this.distance * Math.cos(this.pitch);
-    const vertDist = this.distance * Math.sin(this.pitch);
-
-    const cx = this.target.x + horizDist * Math.sin(this.yaw);
-    const cz = this.target.z + horizDist * Math.cos(this.yaw);
-    const cy = this.target.y + vertDist;
-
-    this.camera.position.set(cx, cy, cz);
-    this.camera.lookAt(this.target);
-    this.callbacks.onCameraMove?.();
   }
 
   _bindEvents() {
-    const dom = this.renderer.domElement;
-
     window.addEventListener('resize', () => {
-      if (!this.container) return;
-      const w = this.container.clientWidth;
-      const h = this.container.clientHeight;
-      this.camera.aspect = w / h;
-      this.camera.updateProjectionMatrix();
-      this.renderer.setSize(w, h);
-      this.callbacks.onCameraMove?.();
+      this._resizeCanvas();
     });
 
     window.addEventListener('keydown', (e) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
       const k = e.key.toLowerCase();
       this.keysPressed.add(k);
-      if (k === 'q') this.rotateCamera(-0.22, 0);
-      if (k === 'e') this.rotateCamera(0.22, 0);
       if (k === 'n') this.resetNorth();
+      if (k === 'q' || k === '=') this.zoomBy(1.15);
+      if (k === 'e' || k === '-') this.zoomBy(0.87);
     });
 
     window.addEventListener('keyup', (e) => {
       this.keysPressed.delete(e.key.toLowerCase());
     });
 
-    dom.addEventListener('contextmenu', (e) => e.preventDefault());
+    this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
-    dom.addEventListener('mousedown', (e) => {
+    this.canvas.addEventListener('mousedown', (e) => {
       this.isDragging = false;
-      this.dragButton = e.button;
-      this.downMouse = { x: e.clientX, y: e.clientY };
+      this.downMouse = { x: e.clientX, y: e.clientY, button: e.button };
       this.lastMouse = { x: e.clientX, y: e.clientY };
     });
 
     window.addEventListener('mousemove', (e) => {
+      const gridPos = this.screenToGrid(e.clientX, e.clientY);
+      this.hoveredTile = gridPos;
+
       if (!this.downMouse) return;
       const dx = e.clientX - this.lastMouse.x;
       const dy = e.clientY - this.lastMouse.y;
+
       if (Math.hypot(e.clientX - this.downMouse.x, e.clientY - this.downMouse.y) > 4) {
         this.isDragging = true;
       }
 
-      if (this.isDragging) {
-        if (this.dragButton === 2 || e.shiftKey) {
-          // 右键拖拽或 Shift+左键：旋转与俯仰 "伪3D" 视角
-          this.yaw -= dx * 0.0065;
-          this.pitch = Math.max(0.52, Math.min(1.32, this.pitch + dy * 0.005));
-          this._updateCameraTransform();
-        } else if (this.dragButton === 0 || this.dragButton === 1) {
-          // 左键或中键拖拽：沿当前相机朝向平移沙盘
-          const panScale = this.distance * 0.0014;
-          const forwardX = -Math.sin(this.yaw);
-          const forwardZ = -Math.cos(this.yaw);
-          const rightX = Math.cos(this.yaw);
-          const rightZ = -Math.sin(this.yaw);
-
-          this.target.x -= (rightX * dx - forwardX * dy) * panScale;
-          this.target.z -= (rightZ * dx - forwardZ * dy) * panScale;
-          this.target.x = Math.max(2, Math.min(62, this.target.x));
-          this.target.z = Math.max(2, Math.min(42, this.target.z));
-          this._updateCameraTransform();
-        }
+      if (this.isDragging && this.downMouse.button === 0) {
+        this.centerX -= dx / this.tileSize;
+        this.centerY -= dy / this.tileSize;
+        this.centerX = Math.max(2, Math.min(62, this.centerX));
+        this.centerY = Math.max(2, Math.min(42, this.centerY));
       }
+
       this.lastMouse = { x: e.clientX, y: e.clientY };
     });
 
     window.addEventListener('mouseup', (e) => {
       if (!this.downMouse) return;
       const wasDragging = this.isDragging;
+      const btn = this.downMouse.button;
       this.downMouse = null;
       this.isDragging = false;
 
-      if (!wasDragging && e.target === dom) {
-        this._handlePointerClick(e);
+      if (!wasDragging && e.target === this.canvas) {
+        this._handleCanvasClick(e, btn);
       }
     });
 
-    dom.addEventListener(
+    this.canvas.addEventListener(
       'wheel',
       (e) => {
         e.preventDefault();
-        this.distance = Math.max(16, Math.min(78, this.distance + e.deltaY * 0.035));
-        this._updateCameraTransform();
+        const before = this.screenToGrid(e.clientX, e.clientY);
+        const factor = e.deltaY < 0 ? 1.12 : 0.89;
+        this.tileSize = Math.max(16, Math.min(68, this.tileSize * factor));
+        const after = this.screenToGrid(e.clientX, e.clientY);
+
+        // 保持鼠标指向的格子在缩放时不偏移
+        this.centerX += before.exactX - after.exactX;
+        this.centerY += before.exactY - after.exactY;
+        this.centerX = Math.max(2, Math.min(62, this.centerX));
+        this.centerY = Math.max(2, Math.min(42, this.centerY));
       },
       { passive: false }
     );
   }
 
-  _handlePointerClick(e) {
-    const rect = this.renderer.domElement.getBoundingClientRect();
-    this.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-    this.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  _handleCanvasClick(e, button) {
+    if (!this.state) return;
+    const { gx, gy, exactX, exactY } = this.screenToGrid(e.clientX, e.clientY);
 
-    this.raycaster.setFromCamera(this.mouse, this.camera);
-    const hits = this.raycaster.intersectObjects(this.pickables, false);
-    if (hits.length === 0) return;
+    // 1. 检查是否点击了某支部队兵牌 (距离 <= 1.25 格)
+    const hitUnit = Object.values(this.state.units).find(
+      (u) => Math.hypot(u.x + 0.5 - exactX, u.y + 0.5 - exactY) <= 1.35
+    );
 
-    const hit = hits[0];
-    const meta = hit.object.userData;
+    // 2. 检查是否点击了某座城池或关港 (距离 <= 1.35 格)
+    const hitSettlement = Object.values(this.state.settlements).find(
+      (s) => Math.hypot(s.x + 0.5 - exactX, s.y + 0.5 - exactY) <= 1.4
+    );
 
-    if (e.button === 2) {
-      // 右键点击地图：如果当前选中了己方部队，直接下达变更行军目标指令
-      const gx = Math.round(hit.point.x);
-      const gy = Math.round(hit.point.z);
+    // 3. 检查是否点击了某处城外内政用地 (自动选中其所属母城)
+    let hitPlotSettlementId = null;
+    for (const s of Object.values(this.state.settlements)) {
+      if ((s.economicPlots || []).some((p) => p.x === gx && p.y === gy)) {
+        hitPlotSettlementId = s.id;
+        break;
+      }
+    }
+
+    if (button === 2) {
+      // 右键点击：若已选中本方部队，下达进军目标指令
+      const meta = hitSettlement
+        ? { pickType: 'SETTLEMENT', id: hitSettlement.id }
+        : { pickType: 'TERRAIN' };
       this.callbacks.onRightClickTile?.(gx, gy, meta);
       return;
     }
 
-    if (meta.pickType === 'SETTLEMENT') {
-      this.selectedSettlementId = meta.id;
+    if (hitUnit) {
+      this.selectedUnitId = hitUnit.id;
+      this.callbacks.onSelectUnit?.(hitUnit.id);
+    } else if (hitSettlement) {
+      this.selectedSettlementId = hitSettlement.id;
       this.selectedUnitId = null;
-      this.callbacks.onSelectSettlement?.(meta.id);
-      if (this.state) this.syncState(this.state);
-    } else if (meta.pickType === 'UNIT') {
-      this.selectedUnitId = meta.id;
-      this.callbacks.onSelectUnit?.(meta.id);
-      if (this.state) this.syncState(this.state);
-    } else if (meta.pickType === 'TERRAIN') {
-      const gx = Math.round(hit.point.x);
-      const gy = Math.round(hit.point.z);
+      this.callbacks.onSelectSettlement?.(hitSettlement.id);
+    } else if (hitPlotSettlementId) {
+      this.selectedSettlementId = hitPlotSettlementId;
+      this.selectedUnitId = null;
+      this.callbacks.onSelectSettlement?.(hitPlotSettlementId);
+    } else {
       this.callbacks.onClickTile?.(gx, gy);
     }
   }
 
   _startLoop() {
-    const animate = () => {
-      this.animFrameId = requestAnimationFrame(animate);
-      const dt = this.clock.getDelta();
+    let last = performance.now();
+    const loop = (now) => {
+      this.animFrameId = requestAnimationFrame(loop);
+      const dt = (now - last) / 1000;
+      last = now;
+      this.animTime += dt;
 
-      // WASD 键盘平滑平移
+      // WASD 键盘平滑移动
       if (this.keysPressed.size > 0) {
-        const speed = this.distance * 0.55 * dt;
-        const forwardX = -Math.sin(this.yaw);
-        const forwardZ = -Math.cos(this.yaw);
-        const rightX = Math.cos(this.yaw);
-        const rightZ = -Math.sin(this.yaw);
-
-        let moved = false;
-        if (this.keysPressed.has('w') || this.keysPressed.has('arrowup')) {
-          this.target.x += forwardX * speed;
-          this.target.z += forwardZ * speed;
-          moved = true;
-        }
-        if (this.keysPressed.has('s') || this.keysPressed.has('arrowdown')) {
-          this.target.x -= forwardX * speed;
-          this.target.z -= forwardZ * speed;
-          moved = true;
-        }
-        if (this.keysPressed.has('a') || this.keysPressed.has('arrowleft')) {
-          this.target.x -= rightX * speed;
-          this.target.z -= rightZ * speed;
-          moved = true;
-        }
-        if (this.keysPressed.has('d') || this.keysPressed.has('arrowright')) {
-          this.target.x += rightX * speed;
-          this.target.z += rightZ * speed;
-          moved = true;
-        }
-        if (moved) {
-          this.target.x = Math.max(2, Math.min(62, this.target.x));
-          this.target.z = Math.max(2, Math.min(42, this.target.z));
-          this._updateCameraTransform();
-        }
+        const panSpeed = (320 / this.tileSize) * dt;
+        if (this.keysPressed.has('w') || this.keysPressed.has('arrowup')) this.centerY -= panSpeed;
+        if (this.keysPressed.has('s') || this.keysPressed.has('arrowdown')) this.centerY += panSpeed;
+        if (this.keysPressed.has('a') || this.keysPressed.has('arrowleft')) this.centerX -= panSpeed;
+        if (this.keysPressed.has('d') || this.keysPressed.has('arrowright')) this.centerX += panSpeed;
+        this.centerX = Math.max(2, Math.min(62, this.centerX));
+        this.centerY = Math.max(2, Math.min(42, this.centerY));
       }
 
-      this.renderer.render(this.scene, this.camera);
+      this._renderFrame();
     };
-    animate();
+    this.animFrameId = requestAnimationFrame(loop);
   }
+}
+
+function roundRect(ctx, x, y, width, height, radius) {
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.lineTo(x + width - radius, y);
+  ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+  ctx.lineTo(x + width, y + height - radius);
+  ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+  ctx.lineTo(x + radius, y + height);
+  ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+  ctx.lineTo(x, y + radius);
+  ctx.quadraticCurveTo(x, y, x + radius, y);
+  ctx.closePath();
+}
+
+function hexToRgba(hex, alpha) {
+  const clean = (hex || '#3b82f6').replace('#', '');
+  const num = parseInt(clean, 16);
+  const r = (num >> 16) & 255;
+  const g = (num >> 8) & 255;
+  const b = num & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }

@@ -1225,29 +1225,29 @@ export function App() {
             h(
               'button',
               {
-                onClick: () => sceneRef.current?.rotateCamera(-0.3, 0),
-                title: '左旋视角 (快捷键 Q)',
+                onClick: () => sceneRef.current?.zoomBy(1.18),
+                title: '放大地图 (滚轮向上)',
                 className: 'px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[11px] cursor-pointer',
               },
-              '↶ Q'
+              '＋ 放大'
             ),
             h(
               'button',
               {
                 onClick: () => sceneRef.current?.resetNorth(),
-                title: '归位正北俯视视角 (快捷键 N)',
+                title: '重置居中战区视角 (快捷键 N)',
                 className: 'px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[11px] cursor-pointer',
               },
-              '🧭 归北'
+              '🎯 居中'
             ),
             h(
               'button',
               {
-                onClick: () => sceneRef.current?.rotateCamera(0.3, 0),
-                title: '右旋视角 (快捷键 E)',
+                onClick: () => sceneRef.current?.zoomBy(0.84),
+                title: '缩小地图 (滚轮向下)',
                 className: 'px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[11px] cursor-pointer',
               },
-              'E ↷'
+              '－ 缩小'
             )
           )
         ),
