@@ -34,9 +34,9 @@ jobs:
         run: |
           for spec in specs/00-overview-and-vision.md \
                       specs/01-core-loop-and-combat.md \
-                      specs/02-economy-pops-and-clans.md \
+                      specs/02-economy-pops-and-politics.md \
                       specs/03-engine-and-ai-architecture.md \
-                      specs/04-data-schema-and-state.md \
+                      specs/04-data-schemas.md \
                       specs/05-roadmap-and-m1-demo-spec.md; do
             test -s "$spec" && echo "✅ Verified $spec" || (echo "❌ Missing $spec" && exit 1)
           done
