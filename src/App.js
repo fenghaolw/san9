@@ -4,10 +4,19 @@
  */
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { evaluateUnitSynergyPreview } from './core/combat/combatEngine.js';
+import {
+  evaluateUnitSynergyPreview,
+  executePrisonerAction,
+  executeStrategicPloy,
+  pushFloatingText,
+} from './core/combat/combatEngine.js';
 import { computeSettlementControlAndYieldPreview } from './core/economy/economyEngine.js';
 import { findPathAStar } from './core/map/pathfinder.js';
-import { startExecutionPhase, stepExecutionTick } from './core/sim/turnEngine.js';
+import {
+  resolveHistoricalEventOption,
+  startExecutionPhase,
+  stepExecutionTick,
+} from './core/sim/turnEngine.js';
 import { deepClone, formatGameDate } from './core/utils/prng.js';
 import { createCentralPlainsScenario, MAP_HEIGHT, MAP_WIDTH } from './data/demoCentralPlains.js';
 import { ECONOMIC_BUILDING_DEFS, FORMATIONS, TACTICS } from './data/tacticsAndFormations.js';
@@ -40,9 +49,12 @@ export function App() {
   const [selectedUnitId, setSelectedUnitId] = useState(null);
   const [lensMode, setLensMode] = useState('TACTICAL');
   // 默认开启【👑 国家意志】全局君主视角，无需点选大地图即可统御全国城池与军团
-  const [leftTab, setLeftTab] = useState('NATIONAL_WILL'); // NATIONAL_WILL | OVERVIEW | POPS_CLAN | PLOTS | OFFICERS
+  const [leftTab, setLeftTab] = useState('NATIONAL_WILL'); // NATIONAL_WILL | PLOYS_PRISONERS | OVERVIEW | POPS_CLAN | PLOTS | OFFICERS
   const [cityFilterMode, setCityFilterMode] = useState('MY_ALL'); // MY_ALL | FRONTLINE | REAR | ENEMY
   const [nationalTargetId, setNationalTargetId] = useState(14); // 国家意志集结讨伐默认目标：虎牢关
+  const [selectedStrategistId, setSelectedStrategistId] = useState(104); // 默认荀彧
+  const [ployTargetUnitId, setPloyTargetUnitId] = useState(2); // 默认敌军部队
+  const [ployTargetOfficerId, setPloyTargetOfficerId] = useState(303); // 默认张辽
   const [layerFilters, setLayerFilters] = useState(DEFAULT_LAYER_FILTERS);
   const [playSpeed, setPlaySpeed] = useState(1); // 0: 暂停, 1: 1x, 2: 2x, 4: 4x
   const [showDeployModal, setShowDeployModal] = useState(false);
@@ -196,12 +208,17 @@ export function App() {
     }
   };
 
-  // 计算当前玩家势力汇总资源、属城列表与野战军团列表
+  // 计算当前玩家势力汇总资源、属城列表、野战军团、俘虏与可用军师列表
   const factionTotals = useMemo(() => {
     const myCities = Object.values(gameState.settlements).filter((s) => s.factionId === activeFactionId);
     const myUnits = Object.values(gameState.units).filter((u) => u.factionId === activeFactionId);
-    const myOfficers = Object.values(gameState.officers).filter((o) => o.factionId === activeFactionId);
-    const idleOfficers = myOfficers.filter((o) => !o.assignedUnitId);
+    const enemyUnits = Object.values(gameState.units).filter((u) => u.factionId !== activeFactionId);
+    const myOfficers = Object.values(gameState.officers).filter(
+      (o) => o.factionId === activeFactionId && !o.capturedByFactionId
+    );
+    const idleOfficers = myOfficers.filter((o) => !o.assignedUnitId && !o.hasActedThisXun);
+    const availableStrategists = idleOfficers.sort((a, b) => b.intelligence - a.intelligence);
+    const prisoners = Object.values(gameState.officers).filter((o) => o.capturedByFactionId === activeFactionId);
     let gold = 0;
     let food = 0;
     let troops = 0;
@@ -219,6 +236,9 @@ export function App() {
       cities: myCities.length,
       myCities,
       myUnits,
+      enemyUnits,
+      availableStrategists,
+      prisoners,
       totalOfficers: myOfficers.length,
       idleOfficers: idleOfficers.length,
       gold,
@@ -571,6 +591,125 @@ export function App() {
     setGameState(next);
   };
 
+  // 切换据点防御方针：【⚔️ 迎击 (INTERCEPT)】vs【🛡️ 坚守 (HOLD)】
+  const handleToggleDefenseStance = (cityId) => {
+    const next = deepClone(gameState);
+    const s = next.settlements[cityId];
+    if (!s || s.factionId !== activeFactionId) return;
+    s.defenseStance = s.defenseStance === 'INTERCEPT' ? 'HOLD' : 'INTERCEPT';
+    next.battleLogs.unshift({
+      id: Date.now(),
+      dateStr: formatGameDate(next.meta.date),
+      type: 'COMBAT',
+      text:
+        s.defenseStance === 'INTERCEPT'
+          ? `⚔️【防务方针·自动迎击】${s.name} 设定为【迎击】：敌军踏入周边 3 格内时，留守武将将自动披挂出城迎战！`
+          : `🛡️【防务方针·闭城死守】${s.name} 设定为【坚守】：全军凭城墙与箭塔据守，绝不轻易出城野战。`,
+      x: s.x,
+      y: s.y,
+    });
+    setGameState(next);
+  };
+
+  // 在当前选中城池的前线方向修筑大地图【🏰 城塞 (FORTRESS)】或【🏹 连弩橹 (TOWER)】
+  const handleBuildFieldFortification = (facType) => {
+    if (!selectedSettlement || !isMySettlement || gameState.meta.phase !== 'STRATEGY_PHASE') return;
+    const next = deepClone(gameState);
+    const fac = next.factions[activeFactionId];
+    const origin = next.settlements[selectedSettlement.id];
+    const costGold = facType === 'FORTRESS' ? 600 : 450;
+
+    if ((fac.commandSeals || 0) <= 0) {
+      alert('本旬【君主政令符】已耗尽！请进入十日进行阶段，待下旬初一恢复政令符。');
+      return;
+    }
+    if (origin.gold < costGold) {
+      alert(`${origin.name} 金库不足（需要 ${costGold} 金）！`);
+      return;
+    }
+
+    // 自动在朝向最近敌方据点 2 格的要道上落成工事
+    const enemyCity =
+      Object.values(next.settlements)
+        .filter((s) => s.factionId !== activeFactionId)
+        .sort((a, b) => Math.hypot(a.x - origin.x, a.y - origin.y) - Math.hypot(b.x - origin.x, b.y - origin.y))[0] ||
+      origin;
+
+    const dx = Math.sign(enemyCity.x - origin.x);
+    const dy = Math.sign(enemyCity.y - origin.y);
+    const fx = Math.max(2, Math.min(next.map.width - 3, origin.x + dx * 2));
+    const fy = Math.max(2, Math.min(next.map.height - 3, origin.y + dy * 2));
+
+    origin.gold -= costGold;
+    fac.commandSeals -= 1;
+
+    const newFac = {
+      id: `fac_${Date.now()}`,
+      type: facType,
+      name: facType === 'FORTRESS' ? `${origin.name}前线城塞` : `${origin.name}连弩橹`,
+      factionId: activeFactionId,
+      x: fx,
+      y: fy,
+      durability: facType === 'FORTRESS' ? 2400 : 1200,
+      maxDurability: facType === 'FORTRESS' ? 2400 : 1200,
+      attackRange: 2,
+      attackPower: facType === 'FORTRESS' ? 420 : 520,
+      healRatePerDay: facType === 'FORTRESS' ? 450 : 0,
+      defenseAuraBonus: facType === 'FORTRESS' ? 0.33 : 0.1,
+    };
+    next.facilities.push(newFac);
+    next.battleLogs.unshift({
+      id: Date.now(),
+      dateStr: formatGameDate(next.meta.date),
+      type: 'COMBAT',
+      text:
+        facType === 'FORTRESS'
+          ? `🏰【筑垒锁钥】${origin.name} 耗资 ${costGold} 金、政令符 1 枚，于要道 (${fx},${fy}) 筑起【${newFac.name}】（每2日治愈450伤兵+33%减伤光环）！`
+          : `🏹【增设箭橹】${origin.name} 耗资 ${costGold} 金、政令符 1 枚，于要道 (${fx},${fy}) 架设【${newFac.name}】！`,
+      highlight: true,
+      x: fx,
+      y: fy,
+    });
+    setGameState(next);
+    sceneRef.current?.focusOnTile(fx, fy);
+  };
+
+  // 执行大地图军师计略（伪报 / 扰乱 / 火计烧粮 / 离间）
+  const handleExecutePloy = (ployType, targetId) => {
+    if (gameState.meta.phase !== 'STRATEGY_PHASE') return;
+    const strategistId = selectedStrategistId || factionTotals.availableStrategists[0]?.id;
+    if (!strategistId) {
+      alert('本旬已无尚未行动的闲置武将可执行计略！');
+      return;
+    }
+    const next = deepClone(gameState);
+    const res = executeStrategicPloy(next, strategistId, ployType, targetId);
+    if (!res.ok) {
+      alert(res.msg);
+      return;
+    }
+    setGameState(next);
+  };
+
+  // 处置大牢战俘（招降纳叛 / 辕门斩首结血仇 / 礼送出境）
+  const handlePrisonerDecision = (officerId, actionType) => {
+    if (gameState.meta.phase !== 'STRATEGY_PHASE') return;
+    const next = deepClone(gameState);
+    const res = executePrisonerAction(next, activeFactionId, officerId, actionType);
+    if (!res.ok) {
+      alert(res.msg);
+      return;
+    }
+    setGameState(next);
+  };
+
+  // 响应历史危机事件抉择弹窗
+  const handleChooseEventOption = (optionId) => {
+    const next = deepClone(gameState);
+    resolveHistoricalEventOption(next, optionId);
+    setGameState(next);
+  };
+
   // ============================================================================
   // 单城内政操作（支持传入 settlementId，供全国属城总览列表一键调用）
   // ============================================================================
@@ -579,14 +718,20 @@ export function App() {
     const cityId = targetCityId || selectedSettlement?.id;
     if (!cityId || gameState.meta.phase !== 'STRATEGY_PHASE') return;
     const next = deepClone(gameState);
+    const fac = next.factions[activeFactionId];
     const s = next.settlements[cityId];
     if (!s || s.factionId !== activeFactionId) return;
+    if ((fac.commandSeals || 0) <= 0) {
+      alert('本旬【君主政令符】已耗尽！');
+      return;
+    }
 
     const preview = computeSettlementControlAndYieldPreview(next, s);
     const draftCount = Math.round(3500 * preview.conscriptBonus);
     const goldCost = 700;
 
     if (s.gold < goldCost || s.pops.freePeasants < draftCount + 3000) return;
+    fac.commandSeals -= 1;
     s.gold -= goldCost;
     s.pops.freePeasants -= draftCount;
     s.troops += draftCount;
@@ -596,7 +741,7 @@ export function App() {
       id: Date.now(),
       dateStr: formatGameDate(next.meta.date),
       type: 'ECONOMY',
-      text: `🛡️【征召新兵】${s.name} 耗资 ${goldCost} 金，从自耕农中征召新兵 ${draftCount.toLocaleString()} 人。`,
+      text: `🛡️【征召新兵】${s.name} 消耗 1 枚政令符与 ${goldCost} 金，从自耕农中征召新兵 ${draftCount.toLocaleString()} 人。`,
       x: s.x,
       y: s.y,
     });
@@ -762,6 +907,11 @@ export function App() {
   const handleConfirmDeployUnit = () => {
     if (!selectedSettlement || deploySlots.length === 0) return;
     const next = deepClone(gameState);
+    const fac = next.factions[activeFactionId];
+    if ((fac.commandSeals || 0) <= 0) {
+      alert('本旬【君主政令符】已耗尽！请进入十日进行阶段，待下旬初一恢复政令符。');
+      return;
+    }
     const origin = next.settlements[selectedSettlement.id];
     const target = next.settlements[deployTargetSettlementId];
     if (!origin || !target || origin.troops < deployTroops) return;
@@ -791,6 +941,7 @@ export function App() {
     const path = findPathAStar(next, origin.x, origin.y, target.x, target.y, deployFormationId);
     const foodTaken = Math.min(origin.food - 5000, Math.round(deployTroops * 1.6));
 
+    fac.commandSeals -= 1;
     origin.troops -= deployTroops;
     origin.food -= foodTaken;
 
@@ -822,6 +973,7 @@ export function App() {
     for (const s of orderedSlots) {
       if (next.officers[s.officerId]) {
         next.officers[s.officerId].assignedUnitId = newUnitId;
+        next.officers[s.officerId].hasActedThisXun = true;
       }
     }
 
@@ -1091,7 +1243,11 @@ export function App() {
               u.statusEffect === 'BLOOD_FEUD_RAGE' &&
                 h('span', { className: 'text-[9px] px-1 rounded bg-red-900/90 text-red-200 font-bold' }, '💢死敌血战'),
               u.statusEffect === 'CONFUSED' &&
-                h('span', { className: 'text-[9px] px-1 rounded bg-purple-900/90 text-purple-200 font-bold' }, '💫混乱中')
+                h('span', { className: 'text-[9px] px-1 rounded bg-purple-900/90 text-purple-200 font-bold' }, '💫混乱中'),
+              u.statusEffect === 'FALSE_REPORT_RETREAT' &&
+                h('span', { className: 'text-[9px] px-1 rounded bg-sky-900/90 text-sky-200 font-bold' }, '🌊中伪报退却'),
+              u.isFlanked &&
+                h('span', { className: 'text-[9px] px-1 rounded bg-orange-900/90 text-orange-200 font-bold' }, '🔥被夹击')
             )
           );
         }
@@ -1124,7 +1280,7 @@ export function App() {
               },
               className: 'px-1.5 py-0.5 rounded bg-amber-950/85 border border-amber-500/70 text-[10px] text-amber-200 font-semibold whitespace-nowrap',
             },
-            `🏹 ${f.name} (${f.durability})`
+            `${f.type === 'FORTRESS' ? '🏰' : '🏹'} ${f.name} (${f.durability})`
           );
         }
 
@@ -1188,7 +1344,20 @@ export function App() {
       // 中部：全局核心资源与国策快速切换
       h(
         'div',
-        { className: 'flex items-center gap-4 text-xs' },
+        { className: 'flex items-center gap-3 text-xs' },
+        h(
+          'div',
+          {
+            title: '每旬初一自动恢复君主政令符（主动出征、施展计略、修筑城塞、紧急征兵每次消耗1枚；城外经济产出与漕运无需消耗）',
+            className: 'flex items-center gap-1.5 bg-amber-950/70 px-2.5 py-1 rounded border border-amber-400/70 text-amber-200 font-extrabold shadow',
+          },
+          '📜 政令符: ',
+          h(
+            'span',
+            { className: 'text-amber-300 font-mono text-sm' },
+            `${activeFaction?.commandSeals ?? 6}/${activeFaction?.maxCommandSeals ?? 6}`
+          )
+        ),
         h(
           'div',
           { className: 'flex items-center gap-3 bg-slate-900/80 px-3 py-1.5 rounded border border-slate-800' },
@@ -1350,12 +1519,13 @@ export function App() {
         )
       ),
 
-      // 5 个主导航标签页（首位即【👑 国家意志】全局视角）
+      // 6 个主导航标签页（首位即【👑 国家意志】全局视角 + 新增【📜 谋略俘虏】）
       h(
         'div',
-        { className: 'grid grid-cols-5 bg-slate-900/95 border-b border-slate-800 text-[11px] font-bold' },
+        { className: 'grid grid-cols-6 bg-slate-900/95 border-b border-slate-800 text-[10px] font-bold' },
         [
           ['NATIONAL_WILL', '👑 国家意志'],
+          ['PLOYS_PRISONERS', `📜 谋略(${factionTotals.prisoners.length})`],
           ['OVERVIEW', '🏰 城防武库'],
           ['POPS_CLAN', '👥 人口世家'],
           ['PLOTS', '🌾 领地用地'],
@@ -1383,14 +1553,66 @@ export function App() {
         { className: 'flex-1 overflow-y-auto p-3 space-y-3 text-xs' },
 
         // ====================================================================
-        // ---- TAB 0: 👑 国家意志（全境战略政令 + 所有城市列表 + 所有军队列表） ----
+        // ---- TAB 0: 👑 国家意志（破局使命卡 + 全境战略政令 + 所有军队/城市列表） ----
         // ====================================================================
         leftTab === 'NATIONAL_WILL' &&
           h(
             React.Fragment,
             null,
 
-            // A. 国家意志 · 一键全局总政令
+            // 0. 🏆 章节式君主破局使命卡 (Chaptered Imperial Missions)
+            gameState.missions &&
+              h(
+                'div',
+                { className: 'p-2.5 rounded-lg bg-gradient-to-r from-amber-950/60 via-slate-900 to-slate-900 border border-amber-400/50 space-y-1.5' },
+                h(
+                  'div',
+                  { className: 'flex items-center justify-between' },
+                  h('span', { className: 'font-extrabold text-amber-300 text-xs' }, '🏆 君主破局章节使命'),
+                  h(
+                    'button',
+                    {
+                      onClick: () => setLeftTab('PLOYS_PRISONERS'),
+                      className: 'px-2 py-0.5 rounded bg-purple-900/80 hover:bg-purple-800 border border-purple-400/60 text-purple-100 text-[10px] font-bold cursor-pointer',
+                    },
+                    `📜 施展伪报/审讯俘虏 (${factionTotals.prisoners.length})`
+                  )
+                ),
+                gameState.missions.map((m) =>
+                  h(
+                    'div',
+                    {
+                      key: m.id,
+                      className: `p-1.5 rounded border text-[11px] flex items-start justify-between gap-2 ${
+                        m.completed
+                          ? 'bg-emerald-950/40 border-emerald-500/50 text-emerald-200'
+                          : 'bg-slate-950/80 border-slate-800 text-slate-200'
+                      }`,
+                    },
+                    h(
+                      'div',
+                      null,
+                      h(
+                        'div',
+                        { className: 'font-bold text-amber-100' },
+                        `${m.completed ? '✅' : '🎯'} [${m.chapter}] ${m.title}`
+                      ),
+                      h('div', { className: 'text-[10px] text-slate-400 mt-0.5' }, m.desc)
+                    ),
+                    h(
+                      'span',
+                      {
+                        className: `shrink-0 px-1.5 py-0.5 rounded text-[9px] font-bold ${
+                          m.completed ? 'bg-emerald-700 text-white' : 'bg-amber-500/20 text-amber-300'
+                        }`,
+                      },
+                      m.completed ? '已达成' : m.rewardText
+                    )
+                  )
+                )
+              ),
+
+            // A. 国家意志 · 一键全局总政令 + 大地图前线【筑城塞/连弩橹】
             h(
               'div',
               { className: 'p-2.5 rounded-lg bg-gradient-to-b from-amber-950/35 to-slate-900/90 border border-amber-500/40 space-y-2' },
@@ -1398,7 +1620,11 @@ export function App() {
                 'div',
                 { className: 'flex items-center justify-between' },
                 h('span', { className: 'font-extrabold text-amber-200' }, '📜 国家意志 · 全局战略政令'),
-                h('span', { className: 'text-[10px] text-amber-300/80' }, '无需逐城点击大地图')
+                h(
+                  'span',
+                  { className: 'text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-mono font-bold' },
+                  `剩余政令符: ${activeFaction?.commandSeals ?? 6}`
+                )
               ),
 
               // 战役集结讨伐令
@@ -1475,7 +1701,36 @@ export function App() {
                   },
                   '🌾 全国抚民清丈'
                 )
-              )
+              ),
+
+              // 前线修筑【🏰 城塞】与【🏹 连弩橹】
+              isMySettlement &&
+                h(
+                  'div',
+                  { className: 'grid grid-cols-2 gap-1.5 pt-1 border-t border-slate-800/80' },
+                  h(
+                    'button',
+                    {
+                      onClick: () => handleBuildFieldFortification('FORTRESS'),
+                      disabled: gameState.meta.phase !== 'STRATEGY_PHASE',
+                      title: '在当前选中城池的前线要道筑起【城塞】（每2日治愈周围军团450伤兵+33%防御减伤光环，耗1政令符+600金）',
+                      className:
+                        'py-1.5 px-2 rounded bg-emerald-950/80 hover:bg-emerald-900 border border-emerald-500/50 text-emerald-200 font-bold text-[11px] disabled:opacity-40 cursor-pointer',
+                    },
+                    `🏰 筑前线城塞 (-600金)`
+                  ),
+                  h(
+                    'button',
+                    {
+                      onClick: () => handleBuildFieldFortification('TOWER'),
+                      disabled: gameState.meta.phase !== 'STRATEGY_PHASE',
+                      title: '在当前选中城池的前线要道架设【连弩橹】（自动远程射杀2格内敌军，耗1政令符+450金）',
+                      className:
+                        'py-1.5 px-2 rounded bg-amber-950/80 hover:bg-amber-900 border border-amber-500/50 text-amber-200 font-bold text-[11px] disabled:opacity-40 cursor-pointer',
+                    },
+                    `🏹 架设连弩橹 (-450金)`
+                  )
+                )
             ),
 
             // B. ⚔️ 全国野战军团总览与直接调度列表 (All Field Armies)
@@ -1492,7 +1747,7 @@ export function App() {
                 h(
                   'div',
                   { className: 'py-2 text-center text-slate-400 text-[11px]' },
-                  '当前无出征野战军团。可在下方属城列表点击【🥁出征】或上方【全国集结讨伐】发兵。'
+                  '当前无出征野战军团。可在下方属城列表点击【🥁出征】或开启【⚔️迎击】自动出城拦截。'
                 ),
               factionTotals.myUnits.map((u) => {
                 const cmd = gameState.officers[u.slots[0]?.officerId];
@@ -1612,7 +1867,11 @@ export function App() {
                   const isMine = s.factionId === activeFactionId;
                   const fac = gameState.factions[s.factionId];
                   const idleCount = Object.values(gameState.officers).filter(
-                    (o) => o.factionId === s.factionId && o.locationSettlementId === s.id && !o.assignedUnitId
+                    (o) =>
+                      o.factionId === s.factionId &&
+                      o.locationSettlementId === s.id &&
+                      !o.assignedUnitId &&
+                      !o.capturedByFactionId
                   ).length;
 
                   return h(
@@ -1648,12 +1907,11 @@ export function App() {
                         h('span', { className: 'font-bold text-amber-100' }, s.name),
                         h(
                           'span',
-                          { className: 'text-[10px] text-slate-400' },
-                          s.type === 'MAJOR_CITY' ? '都市' : s.type === 'PASS' ? '关隘' : '军港'
-                        ),
-                        h('span', { className: 'text-[10px] font-mono text-emerald-300' }, `控${s.controlRate}%`)
+                          { className: 'text-[10px] font-mono text-emerald-300' },
+                          `控${s.controlRate}%`
+                        )
                       ),
-                      // 直接在列表中一键出征、征兵、进入城防详情
+                      // 直接在列表中切换【⚔️迎击/🛡️坚守】、一键出征、征兵、进入城防详情
                       h(
                         'div',
                         { className: 'flex items-center gap-1' },
@@ -1661,9 +1919,23 @@ export function App() {
                           h(
                             'button',
                             {
+                              onClick: () => handleToggleDefenseStance(s.id),
+                              title: '点击切换：⚔️迎击（敌军入3格内时留守武将自动出城拦截）/ 🛡️坚守（闭门凭城墙死守）',
+                              className: `px-1.5 py-0.5 rounded font-bold text-[10px] border cursor-pointer ${
+                                s.defenseStance === 'INTERCEPT'
+                                  ? 'bg-red-900/80 border-red-400 text-red-100'
+                                  : 'bg-slate-800 border-slate-600 text-slate-300'
+                              }`,
+                            },
+                            s.defenseStance === 'INTERCEPT' ? '⚔️迎击' : '🛡️坚守'
+                          ),
+                        isMine &&
+                          h(
+                            'button',
+                            {
                               onClick: () => openDeployModalForSettlement(s.id),
                               disabled: gameState.meta.phase !== 'STRATEGY_PHASE' || idleCount === 0,
-                              title: '从该城编组五将部队出征',
+                              title: '从该城编组五将部队出征 (耗1政令符)',
                               className:
                                 'px-1.5 py-0.5 rounded bg-amber-600/90 hover:bg-amber-500 text-white font-bold text-[10px] disabled:opacity-40 cursor-pointer',
                             },
@@ -1675,7 +1947,7 @@ export function App() {
                             {
                               onClick: () => handleConscriptTroopsForCity(s.id),
                               disabled: gameState.meta.phase !== 'STRATEGY_PHASE' || s.gold < 700,
-                              title: '在该城征召新兵 (-700金)',
+                              title: '在该城征召新兵 (-1政令符, -700金)',
                               className:
                                 'px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-sky-500/40 text-sky-200 text-[10px] disabled:opacity-40 cursor-pointer',
                             },
@@ -1692,7 +1964,7 @@ export function App() {
                             className:
                               'px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] cursor-pointer',
                           },
-                          '📋详情'
+                          '📋'
                         )
                       )
                     ),
@@ -1707,6 +1979,245 @@ export function App() {
                   );
                 })
               )
+            )
+          ),
+
+        // ====================================================================
+        // ---- TAB 0.5: 📜 谋略俘虏（四大军师奇谋【伪报/扰乱/火计/离间】+ 战俘大牢【招降/斩首血仇/释放】） ----
+        // ====================================================================
+        leftTab === 'PLOYS_PRISONERS' &&
+          h(
+            React.Fragment,
+            null,
+            // 1. 🌊 大地图军师计略室
+            h(
+              'div',
+              { className: 'p-2.5 rounded-lg bg-slate-900/90 border border-purple-500/40 space-y-2' },
+              h(
+                'div',
+                { className: 'flex items-center justify-between' },
+                h('span', { className: 'font-extrabold text-purple-200' }, '🌊 军师奇谋 · 伪报/扰乱/火计/离间'),
+                h('span', { className: 'text-[10px] text-amber-300 font-mono' }, '每次消耗 1 枚政令符')
+              ),
+              h(
+                'div',
+                { className: 'flex items-center gap-1.5 text-[11px]' },
+                h('span', { className: 'text-slate-400 shrink-0' }, '执策军师:'),
+                h(
+                  'select',
+                  {
+                    value: selectedStrategistId || factionTotals.availableStrategists[0]?.id || '',
+                    onChange: (e) => setSelectedStrategistId(Number(e.target.value)),
+                    className: 'flex-1 bg-slate-950 border border-slate-700 rounded px-2 py-1 text-amber-200 font-bold text-[11px]',
+                  },
+                  factionTotals.availableStrategists.length === 0
+                    ? h('option', { value: '' }, '本旬无可用闲置武将')
+                    : factionTotals.availableStrategists.map((o) =>
+                        h(
+                          'option',
+                          { key: o.id, value: o.id },
+                          `${o.name} (智${o.intelligence} · 政${o.politics}${
+                            (o.passiveTraits || []).includes('GOD_CALC') ? ' · ★神算必中' : ''
+                          })`
+                        )
+                      )
+                )
+              ),
+
+              // 针对敌方野战军团的【伪报】与【扰乱】
+              h('div', { className: 'text-[11px] font-bold text-sky-300 pt-1' }, '🎯 对敌方野战军团施展【伪报 / 扰乱】：'),
+              factionTotals.enemyUnits.length === 0 &&
+                h('div', { className: 'text-[11px] text-slate-400 py-1' }, '当前大地图上暂无敌方野战军团（开启进行阶段后敌军将出兵）。'),
+              factionTotals.enemyUnits.map((eu) => {
+                const cmd = gameState.officers[eu.slots[0]?.officerId];
+                const eFac = gameState.factions[eu.factionId];
+                return h(
+                  'div',
+                  {
+                    key: eu.id,
+                    className: 'p-2 rounded bg-slate-950/85 border border-slate-800 flex items-center justify-between gap-2',
+                  },
+                  h(
+                    'div',
+                    {
+                      onClick: () => sceneRef.current?.focusOnTile(eu.x, eu.y),
+                      className: 'cursor-pointer',
+                    },
+                    h(
+                      'div',
+                      { className: 'font-bold text-amber-100 text-[11px]' },
+                      `[${eFac?.name}] ${cmd?.name || '敌军'}队 (${eu.troops.toLocaleString()}兵 · 士${eu.morale})`
+                    ),
+                    h(
+                      'div',
+                      { className: 'text-[10px] text-slate-400' },
+                      `坐标(${eu.x},${eu.y}) · 主将智力 ${cmd?.intelligence || 60} · 状态: ${eu.statusEffect}`
+                    )
+                  ),
+                  h(
+                    'div',
+                    { className: 'flex items-center gap-1 shrink-0' },
+                    h(
+                      'button',
+                      {
+                        onClick: () => handleExecutePloy('FALSE_ORDER', eu.id),
+                        disabled: gameState.meta.phase !== 'STRATEGY_PHASE',
+                        title: '伪造撤军虎符，令该敌军部队强制掉头退回出发城池 (-150金)',
+                        className:
+                          'px-2 py-1 rounded bg-sky-800 hover:bg-sky-700 text-white font-bold text-[10px] disabled:opacity-40 cursor-pointer',
+                      },
+                      '🌊伪报退兵'
+                    ),
+                    h(
+                      'button',
+                      {
+                        onClick: () => handleExecutePloy('CONFUSE_PLOY', eu.id),
+                        disabled: gameState.meta.phase !== 'STRATEGY_PHASE',
+                        title: '散布流言扰乱敌军阵脚，使其陷入混乱停滞且防御骤降 (-120金)',
+                        className:
+                          'px-2 py-1 rounded bg-purple-800 hover:bg-purple-700 text-white font-bold text-[10px] disabled:opacity-40 cursor-pointer',
+                      },
+                      '💫扰乱'
+                    )
+                  )
+                );
+              }),
+
+              // 针对敌方据点的【火计烧粮】与【流言离间】
+              h('div', { className: 'text-[11px] font-bold text-orange-300 pt-1' }, '🔥 对敌方城池关隘施展【火计烧粮 / 离间】：'),
+              h(
+                'div',
+                { className: 'space-y-1.5 max-h-48 overflow-y-auto pr-1' },
+                Object.values(gameState.settlements)
+                  .filter((s) => s.factionId !== activeFactionId)
+                  .map((es) => {
+                    const eFac = gameState.factions[es.factionId];
+                    return h(
+                      'div',
+                      {
+                        key: es.id,
+                        className: 'p-1.5 rounded bg-slate-950/85 border border-slate-800 flex items-center justify-between',
+                      },
+                      h(
+                        'div',
+                        {
+                          onClick: () => sceneRef.current?.focusOnTile(es.x, es.y),
+                          className: 'cursor-pointer',
+                        },
+                        h('span', { className: 'font-bold text-amber-100' }, `${es.name} [${eFac?.name}]`),
+                        h('span', { className: 'ml-1.5 text-[10px] text-slate-400 font-mono' }, `粮${(es.food / 1000).toFixed(0)}k · 墙${es.wallDurability}`)
+                      ),
+                      h(
+                        'div',
+                        { className: 'flex items-center gap-1' },
+                        h(
+                          'button',
+                          {
+                            onClick: () => handleExecutePloy('FIRE_SABOTAGE', es.id),
+                            disabled: gameState.meta.phase !== 'STRATEGY_PHASE',
+                            title: '潜入敌城焚毁粮仓与城防 (-180金)',
+                            className:
+                              'px-2 py-0.5 rounded bg-red-800 hover:bg-red-700 text-white font-bold text-[10px] disabled:opacity-40 cursor-pointer',
+                          },
+                          '🔥火计烧粮'
+                        ),
+                        h(
+                          'button',
+                          {
+                            onClick: () => handleExecutePloy('SOW_DISCORD', es.id),
+                            disabled: gameState.meta.phase !== 'STRATEGY_PHASE',
+                            title: '离间敌城守将与豪强，削减忠诚与控制度 (-150金)',
+                            className:
+                              'px-2 py-0.5 rounded bg-amber-800 hover:bg-amber-700 text-white font-bold text-[10px] disabled:opacity-40 cursor-pointer',
+                          },
+                          '🗡️离间'
+                        )
+                      )
+                    );
+                  })
+              )
+            ),
+
+            // 2. ⛓️ 战俘大牢：招降纳叛 / 辕门斩首(结下CK3家族血仇) / 礼送释放
+            h(
+              'div',
+              { className: 'p-2.5 rounded-lg bg-slate-900/90 border border-red-500/40 space-y-2' },
+              h(
+                'div',
+                { className: 'flex items-center justify-between' },
+                h('span', { className: 'font-extrabold text-red-200' }, `⛓️ 战俘大牢与生杀大权 (${factionTotals.prisoners.length} 人)`),
+                h('span', { className: 'text-[10px] text-slate-400' }, '斩首将触发义兄弟/宗族死敌血仇')
+              ),
+              factionTotals.prisoners.length === 0 &&
+                h(
+                  'div',
+                  { className: 'py-3 text-center text-slate-400 text-[11px]' },
+                  '当前大牢内无敌军战俘。在野战歼灭敌军、触发猛将单挑生擒或攻陷城池时可俘获敌将！'
+                ),
+              factionTotals.prisoners.map((p) => {
+                const origFac = gameState.factions[p.factionId];
+                const ruler = gameState.officers[activeFaction?.rulerOfficerId];
+                const diff = getCompatibilityDistance(ruler?.compatibility ?? 25, p.compatibility);
+                return h(
+                  'div',
+                  {
+                    key: p.id,
+                    className: 'p-2 rounded bg-slate-950/90 border border-red-500/30 space-y-1.5',
+                  },
+                  h(
+                    'div',
+                    { className: 'flex items-center justify-between' },
+                    h(
+                      'div',
+                      null,
+                      h('span', { className: 'font-extrabold text-amber-200 text-xs' }, `${p.name} (${p.courtesyName})`),
+                      h('span', { className: 'ml-1.5 text-[10px] text-slate-400' }, `原属: ${origFac?.name || '在野'} · 相性差:${diff}`)
+                    ),
+                    h(
+                      'span',
+                      { className: 'text-[10px] font-mono text-sky-300' },
+                      `统${p.leadership}/武${p.might}/智${p.intelligence}`
+                    )
+                  ),
+                  h(
+                    'div',
+                    { className: 'grid grid-cols-3 gap-1.5 pt-1' },
+                    h(
+                      'button',
+                      {
+                        onClick: () => handlePrisonerDecision(p.id, 'RECRUIT'),
+                        disabled: gameState.meta.phase !== 'STRATEGY_PHASE',
+                        title: '根据君臣相性差与君主魅力劝降该战俘归顺我军 (-1政令符)',
+                        className:
+                          'py-1 rounded bg-emerald-800 hover:bg-emerald-700 text-white font-bold text-[10px] disabled:opacity-40 cursor-pointer',
+                      },
+                      '🤝 劝降归顺'
+                    ),
+                    h(
+                      'button',
+                      {
+                        onClick: () => handlePrisonerDecision(p.id, 'EXECUTE'),
+                        disabled: gameState.meta.phase !== 'STRATEGY_PHASE',
+                        title: '辕门斩首立威 (+35正统威望，但此人义兄弟与血亲将与你结为不共戴天【死敌血仇】！)',
+                        className:
+                          'py-1 rounded bg-red-800 hover:bg-red-700 text-white font-bold text-[10px] disabled:opacity-40 cursor-pointer',
+                      },
+                      '🩸 辕门斩首'
+                    ),
+                    h(
+                      'button',
+                      {
+                        onClick: () => handlePrisonerDecision(p.id, 'RELEASE'),
+                        disabled: gameState.meta.phase !== 'STRATEGY_PHASE',
+                        title: '义释战俘礼送出境 (+25仁德威望)',
+                        className:
+                          'py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 font-bold text-[10px] disabled:opacity-40 cursor-pointer',
+                      },
+                      '🕊️ 礼送释放'
+                    )
+                  )
+                );
+              })
             )
           ),
 
@@ -2872,6 +3383,63 @@ export function App() {
                       )
                     );
                   })
+              )
+            )
+          )
+        )
+      ),
+
+    // ==================== 10. 弹窗 C：历史危机与君主军机抉择弹窗 ====================
+    gameState.activeEventModal &&
+      h(
+        'div',
+        {
+          className:
+            'fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-6',
+        },
+        h(
+          'div',
+          {
+            className:
+              'w-full max-w-xl bg-slate-950 border-2 border-amber-400/80 rounded-xl shadow-2xl overflow-hidden flex flex-col',
+          },
+          h(
+            'div',
+            {
+              className:
+                'px-5 py-3.5 bg-gradient-to-r from-amber-950 via-red-950/80 to-slate-900 border-b border-amber-500/40 flex items-center justify-between',
+            },
+            h('h2', { className: 'text-base font-extrabold text-amber-200 tracking-wide' }, `📜 ${gameState.activeEventModal.title}`),
+            h(
+              'span',
+              { className: 'px-2 py-0.5 rounded bg-amber-500/20 border border-amber-400/50 text-amber-200 text-[11px] font-bold' },
+              '汉室军机抉择'
+            )
+          ),
+          h(
+            'div',
+            { className: 'p-5 space-y-4 text-xs leading-relaxed text-slate-200' },
+            h(
+              'p',
+              { className: 'p-3.5 rounded-lg bg-slate-900/90 border border-slate-800 text-amber-100/95 text-[13px] leading-6' },
+              gameState.activeEventModal.desc
+            ),
+            h('div', { className: 'text-[11px] font-bold text-amber-300' }, '请以国家意志作出战略圣裁：'),
+            h(
+              'div',
+              { className: 'space-y-2.5' },
+              (gameState.activeEventModal.options || []).map((opt) =>
+                h(
+                  'button',
+                  {
+                    key: opt.id,
+                    onClick: () => handleChooseEventOption(opt.id),
+                    className:
+                      'w-full text-left p-3 rounded-lg bg-slate-900/95 hover:bg-amber-950/60 border border-amber-500/40 hover:border-amber-400 transition cursor-pointer group',
+                  },
+                  h('div', { className: 'font-extrabold text-amber-200 group-hover:text-amber-100 text-xs' }, opt.label),
+                  h('div', { className: 'text-[11px] text-emerald-300 mt-1 font-mono' }, `✦ 战略效果：${opt.effectText}`)
+                )
               )
             )
           )

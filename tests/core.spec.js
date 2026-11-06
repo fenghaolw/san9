@@ -5,7 +5,10 @@
 
 import {
   checkUnitElimination,
+  countHexFlankingAttackers,
   evaluateUnitSynergyPreview,
+  executePrisonerAction,
+  executeStrategicPloy,
   getOfficerBondInfo,
 } from '../src/core/combat/combatEngine.js';
 import {
@@ -22,7 +25,7 @@ export function runAllSpecTests() {
   const results = [];
   const assert = (name, condition, detail = '') => {
     results.push({ name, passed: Boolean(condition), detail });
-    if (!condition) {
+    if (!condition && typeof console !== 'undefined' && console.error) {
       console.error(`[FAIL] ${name}: ${detail}`);
     }
   };
@@ -138,6 +141,59 @@ export function runAllSpecTests() {
         state.meta.date.xun === 1 &&
         state.battleLogs.length > 4,
       `推演Ticks=${ticksRun}, 当前旬期=${state.meta.date.month}月中旬, 战报数=${state.battleLogs.length}`
+    );
+  }
+
+  // 8. SPEC-01 v1.2: 军师奇谋【伪报 (FALSE_ORDER)】与【神算】必中及政令符扣除验证
+  {
+    const state = createCentralPlainsScenario(1);
+    const sealsBefore = state.factions[1].commandSeals;
+    // 荀攸 (111, 拥有【神算】特技，闲置在许昌) 对吕布先锋军 (unit 2) 施展【伪报】
+    const res = executeStrategicPloy(state, 111, 'FALSE_ORDER', 2);
+    assert(
+      'SPEC-01 v1.2: 荀攸【神算】施展【伪报】100% 令吕布军陷入伪报退却状态，并扣除 1 枚政令符与单旬行动权',
+      res.ok &&
+        res.succeeded &&
+        state.units[2].statusEffect === 'FALSE_REPORT_RETREAT' &&
+        state.factions[1].commandSeals === sealsBefore - 1 &&
+        state.officers[111].hasActedThisXun === true,
+      `伪报成功=${res.succeeded}, 吕布军状态=${state.units[2].statusEffect}, 政令符=${sealsBefore}->${state.factions[1].commandSeals}`
+    );
+  }
+
+  // 9. SPEC-01 v1.2: 战俘大牢【辕门斩首 (EXECUTE)】触发 CK3 宗族/义兄弟【死敌血仇】验证
+  {
+    const state = createCentralPlainsScenario(1);
+    // 模拟关羽 (502) 被曹操俘虏并斩首，检验刘备 (501) 与张飞 (503) 是否将曹操 (101) 列为死敌
+    state.officers[502].capturedByFactionId = 1;
+    const res = executePrisonerAction(state, 1, 502, 'EXECUTE');
+    const liuHasNemesis = state.officers[501].nemesisIds.includes(101);
+    const zhangHasNemesis = state.officers[503].nemesisIds.includes(101);
+    assert(
+      'SPEC-01 v1.2: 斩首战俘后，其义兄弟/血亲立即与行刑君主结下不共戴天之【死敌血仇 (NEMESIS)】',
+      res.ok && liuHasNemesis && zhangHasNemesis,
+      `刘备仇恨曹操=${liuHasNemesis}, 张飞仇恨曹操=${zhangHasNemesis}`
+    );
+  }
+
+  // 10. SPEC-01 v1.2: 六边形多路合围【夹击包抄】检测验证
+  {
+    const state = createCentralPlainsScenario(1);
+    const targetUnit = state.units[2]; // 吕布军 (41, 19)
+    // 将我军 unit 1 置于 (targetUnit.x - 1, targetUnit.y)，并新增一支我军 unit 99 置于 (targetUnit.x + 1, targetUnit.y) 形成左右夹击
+    state.units[1].x = targetUnit.x - 1;
+    state.units[1].y = targetUnit.y;
+    state.units[99] = {
+      ...state.units[1],
+      id: 99,
+      x: targetUnit.x + 1,
+      y: targetUnit.y,
+    };
+    const flankCount = countHexFlankingAttackers(state, targetUnit);
+    assert(
+      'SPEC-01 v1.2: 当敌军在六边形网格上同时被 >=2 支我军部队近逼时触发【六角夹击包抄】',
+      flankCount >= 2,
+      `合围部队数=${flankCount}`
     );
   }
 

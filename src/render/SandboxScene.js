@@ -365,6 +365,9 @@ export class SandboxScene {
       this._drawUnitsAndMarchRoutes(ctx, state, w, h);
     }
 
+    // ==================== 第七点五层：画布实时战斗特效 (箭雨刀光轨迹 + 头顶掉血飘字) ====================
+    this._drawCombatVFXAndFloatingTexts(ctx, state, w, h);
+
     // ==================== 第八层：鼠标悬停六边形高亮 ====================
     if (this.hoveredTile) {
       const { gx, gy } = this.hoveredTile;
@@ -506,19 +509,32 @@ export class SandboxScene {
       if (fac.durability <= 0) continue;
       const pos = this.gridToScreen(fac.x, fac.y, viewW, viewH);
       const facColor = state.factions[fac.factionId]?.color || '#f59e0b';
+      const isFortress = fac.type === 'FORTRESS';
 
       ctx.save();
-      this._traceHexPath(ctx, pos.x, pos.y, hexR * 0.62);
-      ctx.fillStyle = '#1e293b';
+      if (isFortress) {
+        // 绘制【城塞】1格休整治愈与减伤光环
+        this._traceHexPath(ctx, pos.x, pos.y, hexR * 1.45);
+        ctx.fillStyle = 'rgba(52, 211, 153, 0.10)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(52, 211, 153, 0.45)';
+        ctx.lineWidth = 1.4;
+        ctx.setLineDash([4, 3]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      this._traceHexPath(ctx, pos.x, pos.y, hexR * (isFortress ? 0.72 : 0.62));
+      ctx.fillStyle = isFortress ? '#064e3b' : '#1e293b';
       ctx.fill();
       ctx.strokeStyle = facColor;
-      ctx.lineWidth = 2;
+      ctx.lineWidth = isFortress ? 2.5 : 2;
       ctx.stroke();
 
-      ctx.font = `${Math.max(10, Math.round(ts * 0.34))}px sans-serif`;
+      ctx.font = `${Math.max(10, Math.round(ts * 0.36))}px sans-serif`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(fac.type === 'TOWER' ? '🏹' : '⛺', pos.x, pos.y);
+      ctx.fillText(isFortress ? '🏰' : fac.type === 'TOWER' ? '🏹' : '⛺', pos.x, pos.y);
       ctx.restore();
     }
   }
@@ -695,7 +711,78 @@ export class SandboxScene {
         ctx.fillText(bannerText, pos.x, cy - 14);
       }
 
+      // 六边形多面夹击红色脉冲警示环
+      if (u.isFlanked) {
+        this._traceHexPath(ctx, pos.x, pos.y, (ts / SQRT3) * 1.18);
+        ctx.strokeStyle = 'rgba(249, 115, 22, 0.9)';
+        ctx.lineWidth = 2.4;
+        ctx.setLineDash([4, 2]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
       ctx.restore();
+    }
+  }
+
+  /**
+   * 绘制画布直觉化战斗演出：刀光箭雨脉冲连线 (combatEffects) 与六边形头顶实时掉血/暴击飘字 (floatingTexts)
+   */
+  _drawCombatVFXAndFloatingTexts(ctx, state, viewW, viewH) {
+    const now = Date.now();
+
+    // 1. 刀光箭雨交战射线与碰撞火花
+    for (const fx of state.combatEffects || []) {
+      const p1 = this.gridToScreen(fx.fromX, fx.fromY, viewW, viewH);
+      const p2 = this.gridToScreen(fx.toX, fx.toY, viewW, viewH);
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(p1.x, p1.y);
+      ctx.lineTo(p2.x, p2.y);
+      ctx.strokeStyle = fx.color || '#facc15';
+      ctx.lineWidth = fx.kind === 'SIEGE' ? 3.5 : 2.5;
+      ctx.setLineDash([6, 4]);
+      ctx.lineDashOffset = -this.animTime * 45;
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // 命中点爆裂脉冲圆环
+      const pulseR = 6 + ((this.animTime * 18) % 10);
+      ctx.beginPath();
+      ctx.arc(p2.x, p2.y, pulseR, 0, Math.PI * 2);
+      ctx.strokeStyle = '#fef08a';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // 2. 六边形头顶实时掉血/暴击/计略飘字 (保留最近 2.6 秒内的飘字并向上浮动)
+    if (state.floatingTexts && state.floatingTexts.length > 0) {
+      for (let i = 0; i < state.floatingTexts.length; i++) {
+        const ft = state.floatingTexts[i];
+        const ageMs = now - (ft.createdAt || now);
+        if (ageMs > 2600) continue;
+
+        const progress = Math.min(1, ageMs / 2600);
+        const pos = this.gridToScreen(ft.x, ft.y, viewW, viewH);
+        const floatY = pos.y - 26 - progress * 28 - (i % 3) * 13;
+        const alpha = 1 - Math.pow(progress, 2);
+
+        ctx.save();
+        ctx.font = '900 12px "PingFang SC", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+
+        const textW = ctx.measureText(ft.text).width + 12;
+        ctx.fillStyle = `rgba(15, 23, 42, ${0.85 * alpha})`;
+        roundRect(ctx, pos.x - textW / 2, floatY - 9, textW, 18, 4);
+        ctx.fill();
+
+        ctx.fillStyle = ft.color || '#f87171';
+        ctx.globalAlpha = alpha;
+        ctx.fillText(ft.text, pos.x, floatY);
+        ctx.restore();
+      }
     }
   }
 

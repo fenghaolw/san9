@@ -1242,6 +1242,57 @@ export function createCentralPlainsScenario(playerFactionId = 1) {
     }
   }
 
+  // 新增一名初始关押在许昌大牢的吕布军先锋战俘【宋宪】，方便玩家开局即可体验【招降 / 辕门斩首(结下死敌血仇) / 礼送】
+  officers[306] = {
+    id: 306,
+    name: '宋宪',
+    courtesyName: '公则',
+    factionId: 3,
+    locationSettlementId: 4, // 关押于许昌
+    assignedUnitId: null,
+    capturedByFactionId: 1,  // 被曹操军生擒关押中
+    isGovernor: false,
+    birthYear: 162,
+    leadership: 75,
+    might: 81,
+    intelligence: 52,
+    politics: 48,
+    charisma: 55,
+    loyalty: 66,
+    compatibility: 28,       // 与曹操(25)相性接近，容易招降！
+    bloodLineId: null,
+    clanId: null,
+    swornBrotherIds: [302, 303], // 与高顺、张辽为并州同袍义兄弟（若斩首宋宪，张辽高顺将视曹操为血仇死敌！）
+    spouseId: null,
+    nemesisIds: [],
+    courtOfficeId: '将校',
+    passiveTraits: ['valiant'],
+    personalities: ['RECKLESS'],
+    learnedTactics: ['inf_1', 'cav_1', 'bow_1'],
+    proficiencies: { INFANTRY: 320, CAVALRY: 350, CROSSBOW: 280 },
+    hasActedThisXun: false,
+  };
+
+  // 为所有势力初始化每旬【君主政令符（命令书）】
+  for (const fac of Object.values(factions)) {
+    const baseSeals = 5 + Math.floor((fac.prestige || 400) / 250);
+    fac.commandSeals = baseSeals;
+    fac.maxCommandSeals = baseSeals;
+    fac.missionBonusSeals = 0;
+  }
+
+  // 为所有据点初始化【迎击 / 坚守】防御方针 (前线与关隘默认主动出城迎击 INTERCEPT)
+  for (const s of Object.values(settlements)) {
+    s.defenseStance =
+      s.type === 'PASS' || s.logisticsRole === 'FRONTLINE_DEMAND' ? 'INTERCEPT' : 'HOLD';
+  }
+
+  // 为所有武将补齐战俘与单旬行动状态字段
+  for (const off of Object.values(officers)) {
+    if (off.capturedByFactionId === undefined) off.capturedByFactionId = null;
+    if (off.hasActedThisXun === undefined) off.hasActedThisXun = false;
+  }
+
   /** @type {import('../core/types/index.js').GameState} */
   return {
     meta: {
@@ -1274,18 +1325,18 @@ export function createCentralPlainsScenario(playerFactionId = 1) {
     facilities: {
       1: {
         id: 1,
-        type: 'TOWER',
-        name: '官渡连弩橹',
+        type: 'FORTRESS',
+        name: '官渡城塞',
         factionId: 1,
         x: 33,
         y: 21,
-        durability: 900,
-        maxDurability: 900,
+        durability: 1500,
+        maxDurability: 1500,
       },
       2: {
         id: 2,
-        type: 'CAMP',
-        name: '虎牢前哨阵',
+        type: 'TOWER',
+        name: '虎牢连弩橹',
         factionId: 4,
         x: 29,
         y: 24,
@@ -1293,6 +1344,56 @@ export function createCentralPlainsScenario(playerFactionId = 1) {
         maxDurability: 1100,
       },
     },
+    // 章节式君主破局使命树 (Imperial Missions)
+    missions: [
+      {
+        id: 'mission_1_tiger_cage',
+        stage: 1,
+        title: '第一章：定鼎兖豫 · 兵锋叩虎牢',
+        desc: '攻占咽喉要道【虎牢关】或【白马港】，或者累计统辖 6 座以上据点。',
+        rewardText: '永久政令符上限 +1 · 君主信望 +80 · 许昌金库 +2,000',
+        completed: false,
+      },
+      {
+        id: 'mission_2_emperor_luoyang',
+        stage: 2,
+        title: '第二章：奉天子以令不臣',
+        desc: '挥师西进攻克旧都【洛阳】，迎奉汉献帝定都许昌，威服天下诸侯。',
+        rewardText: '永久政令符上限 +2 · 君主信望 +150 · 全境世家好感 +20',
+        completed: false,
+      },
+      {
+        id: 'mission_3_guandu_hegemony',
+        stage: 3,
+        title: '第三章：官渡争锋 · 饮马黄河',
+        desc: '跨黄河夺取河北门户【黎阳港】或【邺城】，奠定北方霸业。',
+        rewardText: '永久政令符上限 +2 · 西凉铁骑战马 +15,000 · 霸主威名',
+        completed: false,
+      },
+    ],
+    // 交互式历史危机事件弹窗状态
+    activeEventModal: {
+      id: 'evt_194_opening_crisis',
+      title: '🔥 兴平元年风云：《吕布袭兖州与虎牢军机》',
+      dateStr: '194年3月上旬',
+      desc: '温侯吕布率并州狼骑自濮阳西进，窥伺我兖州重镇【陈留】与黄河渡口【白马港】；与此同时，西凉董卓军据守【虎牢关】，夏侯惇部已孤军深入嵩山隘口。主公当如何定夺军机？',
+      options: [
+        {
+          id: 'OPT_OFFENSIVE',
+          label: '⚔️ 【先发制人 · 强攻虎牢】急调虎豹精骑驰援陈留前线，令诸将死战破关！',
+          effectDesc: '陈留兵力 +5,000、战马 +4,000；我方全体野战军团士气 +10；本旬额外获得 +2 枚君主政令符',
+        },
+        {
+          id: 'OPT_STRATAGEM',
+          label: '📜 【荀彧奇谋 · 筑垒惑敌】于前线赶筑连弩橹，并授权军师对吕布军施展伪报惑敌！',
+          effectDesc: '在陈留北郊自动修筑【陈留连弩橹】；吕布先头部队陷入【混乱】3日；许昌金库 +1,200、颍川荀氏好感 +15',
+        },
+      ],
+    },
+    triggeredEventIds: ['evt_194_opening_crisis'],
+    // 画布实时战斗视觉特效与飘字队列
+    combatEffects: [],
+    floatingTexts: [],
     battleLogs: [
       {
         id: 1,
@@ -1307,8 +1408,8 @@ export function createCentralPlainsScenario(playerFactionId = 1) {
         id: 2,
         dateStr: '194年3月上旬',
         type: 'ECONOMY',
-        text: '【屯田令】曹操于许昌、陈留推行军屯制度，招抚中原流民垦荒，农田兵粮产出提升 +25%。',
-        highlight: false,
+        text: '【大牢战俘】前哨战生擒吕布麾下猛将【宋宪】关押于许昌大牢，主公可在左侧【📜军略俘虏】面板将其招降或斩首！',
+        highlight: true,
         x: 33,
         y: 29,
       },
